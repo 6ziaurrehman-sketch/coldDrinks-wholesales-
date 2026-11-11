@@ -23,6 +23,7 @@ import { useTheme } from '@/theme/useTheme';
 import { useWholesalerStore } from '@/store/wholesalerStore';
 import { formatMoney } from '@/utils/formatMoney';
 import { supabase } from '@/lib/supabase';
+import { wholesalerService } from '@/lib/wholesalerService';
 
 type MainTab = 'analytics' | 'danger_zone';
 type AnalyticsPeriod = 'week' | 'month' | 'all';
@@ -56,6 +57,7 @@ interface ProductItem {
   sku?: string | null;
   packaging_type?: string | null;
   category_name?: string;
+  size_label?: string;
   variants_count?: number;
   stock_units?: number;
   price?: number;
@@ -203,39 +205,96 @@ export default function AdminManagementScreen() {
         );
       }
 
-      // 3. Fetch Products
-      const { data: prodsData } = await (supabase as any)
+      // 3. Fetch Products (use explicit category FK & join inventory.total_units instead of non-existent stock_quantity)
+      let prodsRes = await (supabase as any)
         .from('products')
         .select(`
           id,
           name,
           sku,
           packaging_type,
-          category:categories(name),
-          variants:product_variants(id, stock_quantity, price)
+          category:categories!products_category_id_fkey(name),
+          variants:product_variants(
+            id,
+            size_label,
+            price,
+            inventory(total_units)
+          )
         `)
         .order('name');
 
-      if (prodsData) {
+      if (prodsRes.error) {
+        console.warn('Products inventory join failed, falling back to basic query:', prodsRes.error.message);
+        prodsRes = await (supabase as any)
+          .from('products')
+          .select(`
+            id,
+            name,
+            sku,
+            packaging_type,
+            variants:product_variants(id, size_label, price)
+          `)
+          .order('name');
+      }
+
+      if (prodsRes.data && prodsRes.data.length > 0) {
         setProducts(
-          prodsData.map((p: any) => {
-            const totalStock = (p.variants || []).reduce(
-              (acc: number, v: any) => acc + (Number(v.stock_quantity) || 0),
-              0
-            );
-            const firstPrice = p.variants?.[0]?.price || 0;
+          prodsRes.data.map((p: any) => {
+            const totalStock = (p.variants || []).reduce((acc: number, v: any) => {
+              const invRecord = Array.isArray(v.inventory) ? v.inventory[0] : v.inventory;
+              return acc + (Number(invRecord?.total_units) || 0);
+            }, 0);
+            const firstPrice = Number(p.variants?.[0]?.price || 0);
+            const sizeLabel = (p.variants || [])
+              .map((v: any) => v.size_label)
+              .filter(Boolean)
+              .join(', ');
             return {
               id: p.id,
               name: p.name,
               sku: p.sku,
               packaging_type: p.packaging_type,
               category_name: p.category?.name || 'General',
+              size_label: sizeLabel || undefined,
               variants_count: p.variants?.length || 0,
               stock_units: totalStock,
               price: firstPrice,
             };
           })
         );
+      } else {
+        // Fallback to SECURITY DEFINER inventory RPC (guaranteed to match Inventory tab on mobile)
+        try {
+          const invItems = await wholesalerService.getInventory();
+          const grouped = new Map<string, ProductItem>();
+          invItems.forEach((item) => {
+            const existing = grouped.get(item.product_id);
+            if (existing) {
+              existing.variants_count = (existing.variants_count || 1) + 1;
+              existing.stock_units = (existing.stock_units || 0) + (item.total_units || 0);
+              if (item.size_label && !existing.size_label?.includes(item.size_label)) {
+                existing.size_label = existing.size_label
+                  ? `${existing.size_label}, ${item.size_label}`
+                  : item.size_label;
+              }
+            } else {
+              grouped.set(item.product_id, {
+                id: item.product_id,
+                name: item.product_name,
+                sku: null,
+                packaging_type: item.packaging_type,
+                category_name: item.category_name || 'General',
+                size_label: item.size_label || undefined,
+                variants_count: 1,
+                stock_units: item.total_units || 0,
+                price: item.price_per_carton || 0,
+              });
+            }
+          });
+          setProducts(Array.from(grouped.values()));
+        } catch {
+          // Leave products empty if both table and RPC fail
+        }
       }
 
       // 4. Fetch Sales History
@@ -540,7 +599,21 @@ export default function AdminManagementScreen() {
           p_product_id: id,
         });
         if (rpcErr) {
-          await (supabase as any).from('product_variants').delete().eq('product_id', id);
+          const { data: varRows } = await (supabase as any)
+            .from('product_variants')
+            .select('id')
+            .eq('product_id', id);
+          const varIds = (varRows || []).map((v: any) => v.id);
+          if (varIds.length > 0) {
+            await (supabase as any).from('inventory').delete().in('variant_id', varIds);
+            await (supabase as any).from('stock_movements').delete().in('variant_id', varIds);
+            await (supabase as any).from('stock_adjustments').delete().in('variant_id', varIds);
+            await (supabase as any).from('sale_items').delete().in('variant_id', varIds);
+            await (supabase as any).from('purchase_items').delete().in('variant_id', varIds);
+            await (supabase as any).from('order_items').delete().in('variant_id', varIds);
+            await (supabase as any).from('stock_reservations').delete().in('variant_id', varIds);
+            await (supabase as any).from('product_variants').delete().eq('product_id', id);
+          }
           const { error } = await (supabase as any).from('products').delete().eq('id', id);
           if (error) throw error;
         }
@@ -567,6 +640,10 @@ export default function AdminManagementScreen() {
 
       setItemToDelete(null);
       await fetchData();
+      if (type === 'inventory') {
+        void loadInventory(undefined, true);
+        void loadDashboard(undefined, true);
+      }
 
       const successMsg = `Successfully removed ${itemToDelete.title}`;
       if (Platform.OS === 'web') {
@@ -653,13 +730,15 @@ export default function AdminManagementScreen() {
       );
     }
     if (dangerCategory === 'inventory') {
-      return products.filter(
-        (p) =>
-          !q ||
-          p.name.toLowerCase().includes(q) ||
+      return products.filter((p) => {
+        if (!q) return true;
+        const combined = `${p.name} ${p.size_label || ''}`.toLowerCase();
+        return (
+          combined.includes(q) ||
           (p.sku && p.sku.toLowerCase().includes(q)) ||
           p.category_name?.toLowerCase().includes(q)
-      );
+        );
+      });
     }
     if (dangerCategory === 'sales') {
       return sales.filter(
@@ -1213,6 +1292,7 @@ export default function AdminManagementScreen() {
                   onChangeText={setSearchQuery}
                   style={styles.searchInput}
                   autoCapitalize="none"
+                  autoCorrect={false}
                 />
                 {searchQuery ? (
                   <Pressable onPress={() => setSearchQuery('')} hitSlop={8}>

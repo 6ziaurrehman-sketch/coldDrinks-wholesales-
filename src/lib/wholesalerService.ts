@@ -11,6 +11,29 @@ import {
 } from '@/types/wholesaler.types';
 import { mapSupabaseError } from '@/lib/errors';
 
+type SaleUnitEnum = 'carton' | 'case' | 'shrink' | 'pack' | 'single';
+
+/** Maps UI packaging labels (e.g. crate, tray, box) to valid PostgreSQL sale_unit_enum values. */
+function mapPackagingToSaleUnit(packagingType?: string): SaleUnitEnum {
+  const normalized = (packagingType || '').trim().toLowerCase();
+  if (
+    normalized === 'carton' ||
+    normalized === 'case' ||
+    normalized === 'shrink' ||
+    normalized === 'pack' ||
+    normalized === 'single'
+  ) {
+    return normalized;
+  }
+  if (normalized === 'crate' || normalized === 'tray' || normalized === 'box') {
+    return 'case';
+  }
+  if (normalized === 'bottle' || normalized === 'can' || normalized === 'unit' || normalized === 'piece') {
+    return 'single';
+  }
+  return 'carton';
+}
+
 export const wholesalerService = {
   // 1. Dashboard Metrics
   async getDashboardMetrics(range?: string): Promise<WholesalerDashboardMetrics> {
@@ -206,47 +229,72 @@ export const wholesalerService = {
 
   // 4. Products: Add & Edit
   async addProduct(input: WholesalerProductInput): Promise<{ product_id: string; variant_id: string }> {
+    let createdProductId: string | null = null;
+    let createdVariantId: string | null = null;
+
     try {
-      // 1. Get or create category
+      // 1. Resolve category (optional fallback to first active category)
       let categoryId = input.category_id;
       if (!categoryId) {
-        const { data: defaultCat } = await (supabase as any).from('categories').select('id').limit(1).single();
-        categoryId = defaultCat?.id;
+        const { data: defaultCat } = await (supabase as any)
+          .from('categories')
+          .select('id')
+          .order('sort_order', { ascending: true })
+          .limit(1)
+          .maybeSingle();
+        categoryId = defaultCat?.id ?? null;
       }
 
       // 2. Insert product
       const activeFlag = input.status === 'disabled' || input.is_active === false ? false : true;
+      const packagingType = input.packaging_type || 'carton';
+      const skuValue =
+        input.sku?.trim() || `SKU-${Date.now()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+
       const { data: prod, error: pErr } = await (supabase as any)
         .from('products')
         .insert({
           name: input.name,
-          category_id: categoryId,
+          category_id: categoryId || null,
           brand_id: input.brand_id || null,
           image_url: input.image_url || null,
-          packaging_type: input.packaging_type,
+          packaging_type: packagingType,
           barcode: input.barcode || null,
-          sku: input.sku || `SKU-${Date.now()}`,
+          sku: skuValue,
           is_active: activeFlag,
         })
         .select('id')
         .single();
 
       if (pErr) throw pErr;
+      createdProductId = prod.id;
 
-      // 3. Insert product variant
-      const pieces = Math.max(1, input.pieces_per_carton || 1);
-      const unitSale = input.unit_sale_price || Math.round((input.price / pieces) * 100) / 100;
+      // 3. Insert product variant (sale_unit is NOT NULL sale_unit_enum in DB)
+      const pieces = Math.max(1, Math.round(Number(input.pieces_per_carton) || 1));
+      const rawPrice = Math.max(0, Number(input.price) || 0);
+      const rawCost = Math.max(0, Number(input.cost_price) || 0);
+      const parsedUnitSale = Number(input.unit_sale_price);
+      const unitSale =
+        input.unit_sale_price !== undefined && Number.isFinite(parsedUnitSale) && parsedUnitSale >= 0
+          ? parsedUnitSale
+          : Math.round((rawPrice / pieces) * 100) / 100;
+      const saleUnit = mapPackagingToSaleUnit(packagingType);
+      const stockStatus = input.status === 'out_of_stock' ? 'out_of_stock' : 'in_stock';
+      const sizeLabel = input.size_label?.trim() || 'Regular';
 
       const { data: variant, error: vErr } = await (supabase as any)
         .from('product_variants')
         .insert({
           product_id: prod.id,
-          size_label: input.size_label,
-          packaging_type: input.packaging_type,
+          sale_unit: saleUnit,
+          variant_name: sizeLabel,
+          size_label: sizeLabel,
+          packaging_type: packagingType,
           pieces_per_unit: pieces,
-          price: input.price,
-          cost_price: input.cost_price,
+          price: rawPrice,
+          cost_price: rawCost,
           unit_sale_price: unitSale,
+          stock_status: stockStatus,
           image_url: input.image_url || null,
           barcode: input.barcode || null,
           is_active: activeFlag,
@@ -255,16 +303,31 @@ export const wholesalerService = {
         .single();
 
       if (vErr) throw vErr;
+      createdVariantId = variant.id;
 
       // 4. Initialize inventory row
-      await (supabase as any).from('inventory').insert({
-        variant_id: variant.id,
-        total_units: 0,
-        low_stock_threshold: 24,
-      });
+      const { error: invErr } = await (supabase as any)
+        .from('inventory')
+        .upsert(
+          {
+            variant_id: variant.id,
+            total_units: 0,
+            low_stock_threshold: 24,
+          },
+          { onConflict: 'variant_id' }
+        );
+
+      if (invErr) throw invErr;
 
       return { product_id: prod.id, variant_id: variant.id };
     } catch (err) {
+      // Roll back partial records so failed saves never leave orphan products without variants/inventory
+      if (createdVariantId) {
+        await (supabase as any).from('product_variants').delete().eq('id', createdVariantId);
+      }
+      if (createdProductId) {
+        await (supabase as any).from('products').delete().eq('id', createdProductId);
+      }
       throw mapSupabaseError(err, { actionName: 'addProduct', isWrite: true });
     }
   },
@@ -324,13 +387,21 @@ export const wholesalerService = {
       }
 
       const varUpdate: any = {};
-      if (params.sizeLabel) varUpdate.size_label = params.sizeLabel;
-      if (params.packagingType) varUpdate.packaging_type = params.packagingType;
-      if (params.piecesPerCarton !== undefined) varUpdate.pieces_per_unit = params.piecesPerCarton;
+      if (params.sizeLabel) {
+        varUpdate.size_label = params.sizeLabel;
+        varUpdate.variant_name = params.sizeLabel;
+      }
+      if (params.packagingType) {
+        varUpdate.packaging_type = params.packagingType;
+        varUpdate.sale_unit = mapPackagingToSaleUnit(params.packagingType);
+      }
+      if (params.piecesPerCarton !== undefined) varUpdate.pieces_per_unit = Math.max(1, Math.round(params.piecesPerCarton));
       if (params.pricePerCarton !== undefined) varUpdate.price = params.pricePerCarton;
       if (params.costPrice !== undefined) varUpdate.cost_price = params.costPrice;
       if (params.unitSalePrice !== undefined) varUpdate.unit_sale_price = params.unitSalePrice;
       if (activeState !== undefined) varUpdate.is_active = activeState;
+      if (params.status === 'out_of_stock') varUpdate.stock_status = 'out_of_stock';
+      else if (params.status === 'active') varUpdate.stock_status = 'in_stock';
       if (params.imageUrl !== undefined) varUpdate.image_url = params.imageUrl;
 
       if (Object.keys(varUpdate).length > 0) {
@@ -561,6 +632,48 @@ export const wholesalerService = {
       return { ...sale, items: items || [] };
     } catch (err) {
       throw mapSupabaseError(err, { actionName: 'getSaleDetail' });
+    }
+  },
+
+  /**
+   * Batch fetches full sale records and line items for multiple slips (e.g. A4 PDF export).
+   */
+  async getSalesDetailsBatch(saleIds: string[]): Promise<any[]> {
+    if (!saleIds || saleIds.length === 0) return [];
+    try {
+      const chunkSize = 80;
+      const salesById = new Map<string, any>();
+      const itemsBySaleId = new Map<string, any[]>();
+
+      for (let i = 0; i < saleIds.length; i += chunkSize) {
+        const chunk = saleIds.slice(i, i + chunkSize);
+        const [salesRes, itemsRes] = await Promise.all([
+          (supabase as any).from('sales').select('*').in('id', chunk),
+          (supabase as any).from('sale_items').select('*').in('sale_id', chunk),
+        ]);
+
+        if (salesRes.error) throw salesRes.error;
+        if (itemsRes.error) throw itemsRes.error;
+
+        (salesRes.data || []).forEach((s: any) => {
+          salesById.set(s.id, s);
+        });
+        (itemsRes.data || []).forEach((it: any) => {
+          const list = itemsBySaleId.get(it.sale_id) || [];
+          list.push(it);
+          itemsBySaleId.set(it.sale_id, list);
+        });
+      }
+
+      return saleIds
+        .map((id) => {
+          const sale = salesById.get(id);
+          if (!sale) return null;
+          return { ...sale, items: itemsBySaleId.get(id) || [] };
+        })
+        .filter(Boolean);
+    } catch (err) {
+      throw mapSupabaseError(err, { actionName: 'getSalesDetailsBatch' });
     }
   },
 

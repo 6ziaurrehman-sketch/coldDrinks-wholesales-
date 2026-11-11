@@ -24,6 +24,13 @@ import { formatMoney } from '@/utils/formatMoney';
 import { WholesalerSaleSummary } from '@/types/wholesaler.types';
 import { matchSalesSlip } from '@/utils/searchUtils';
 import { supabase } from '@/lib/supabase';
+import {
+  getKarachiDateKey,
+  getTodayAndYesterdayKeys,
+  shareSalesSlipsPdf,
+  type PdfSalesSlipData,
+  type SlipsPerPageOption,
+} from '@/utils/salesSlipPdf';
 
 // Modals
 import { SalesSlipModal } from '@/components/wholesaler/SalesSlipModal';
@@ -43,7 +50,11 @@ interface SalesSlipCardProps {
   primaryColor: string;
   successColor: string;
   errorColor: string;
+  selectionMode: boolean;
+  isSelected: boolean;
   onOpenReceipt: (item: WholesalerSaleSummary) => void;
+  onToggleSelect: (id: string) => void;
+  onLongPressSelect: (id: string) => void;
 }
 
 const SalesSlipCard = React.memo(function SalesSlipCard({
@@ -51,7 +62,11 @@ const SalesSlipCard = React.memo(function SalesSlipCard({
   primaryColor,
   successColor,
   errorColor,
+  selectionMode,
+  isSelected,
   onOpenReceipt,
+  onToggleSelect,
+  onLongPressSelect,
 }: SalesSlipCardProps) {
   const parsed = item.sale_date ? new Date(item.sale_date) : new Date();
   const valid = isNaN(parsed.getTime()) ? new Date() : parsed;
@@ -65,9 +80,33 @@ const SalesSlipCard = React.memo(function SalesSlipCard({
   const isPartial = item.paid_amount > 0 && item.balance_due > 0;
 
   return (
-    <Pressable onPress={() => onOpenReceipt(item)}>
-      <Card style={styles.card}>
+    <Pressable
+      onPress={() => (selectionMode ? onToggleSelect(item.id) : onOpenReceipt(item))}
+      onLongPress={() => {
+        if (!selectionMode) {
+          onLongPressSelect(item.id);
+        }
+      }}
+    >
+      <Card
+        style={[
+          styles.card,
+          selectionMode && isSelected && {
+            borderColor: primaryColor,
+            borderWidth: 1.5,
+            backgroundColor: '#eff6ff',
+          },
+        ]}
+      >
         <View style={styles.cardHeader}>
+          {selectionMode && (
+            <Ionicons
+              name={isSelected ? 'checkbox' : 'square-outline'}
+              size={22}
+              color={isSelected ? primaryColor : '#94a3b8'}
+              style={{ marginRight: 8 }}
+            />
+          )}
           <AppText variant="body" style={styles.shopNameText} numberOfLines={1}>
             {item.customer_name_snapshot}
           </AppText>
@@ -178,6 +217,13 @@ export default function OrdersAndSlipsScreen() {
   const [receiptItems, setReceiptItems] = useState<any[]>([]);
   const [paymentCustomer, setPaymentCustomer] = useState<any | null>(null);
   const [updatingOrderId, setUpdatingOrderId] = useState<string | null>(null);
+
+  // Batch PDF Selection & A4 Layout State
+  const [isSelectionMode, setIsSelectionMode] = useState(false);
+  const [selectedSaleIds, setSelectedSaleIds] = useState<Set<string>>(() => new Set());
+  const [slipsPerPage, setSlipsPerPage] = useState<SlipsPerPageOption>(4);
+  const [exportingPdf, setExportingPdf] = useState(false);
+  const [selectionLabel, setSelectionLabel] = useState<string>('Selected');
 
   // Fetch Incoming Orders from User Site
   const fetchIncomingOrders = useCallback(async () => {
@@ -444,6 +490,153 @@ export default function OrdersAndSlipsScreen() {
   }, [filteredSales]);
 
   const hasActiveFilters = search.trim().length > 0 || statusFilter !== 'all' || dateFilter !== 'all';
+
+  // Quick Date Counts (Today & Yesterday in Asia/Karachi) for Batch PDF Selection
+  const { todayIds, yesterdayIds } = useMemo(() => {
+    const { todayKey, yesterdayKey } = getTodayAndYesterdayKeys();
+    const tIds: string[] = [];
+    const yIds: string[] = [];
+    for (const s of salesHistory) {
+      const k = s.sale_date ? getKarachiDateKey(s.sale_date) : null;
+      if (!k) continue;
+      if (k === todayKey) tIds.push(s.id);
+      else if (k === yesterdayKey) yIds.push(s.id);
+    }
+    return { todayIds: tIds, yesterdayIds: yIds };
+  }, [salesHistory]);
+
+  const handleEnterSelectionMode = useCallback((initialId?: string) => {
+    setIsSelectionMode(true);
+    setSelectionLabel('Manual');
+    if (initialId) {
+      setSelectedSaleIds(new Set([initialId]));
+    }
+  }, []);
+
+  const handleExitSelectionMode = useCallback(() => {
+    setIsSelectionMode(false);
+    setSelectedSaleIds(new Set());
+  }, []);
+
+  const handleToggleSaleSelect = useCallback((id: string) => {
+    setSelectionLabel('Selected');
+    setSelectedSaleIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+
+  const handleSelectToday = useCallback(() => {
+    if (todayIds.length === 0) {
+      const msg = 'No sales slips recorded for Today.';
+      if (Platform.OS === 'web') window.alert(msg);
+      else Alert.alert('No Slips Today', msg);
+      return;
+    }
+    setSearch('');
+    setStatusFilter('all');
+    setDateFilter('all');
+    setSelectionLabel('Today');
+    setSelectedSaleIds(new Set(todayIds));
+  }, [todayIds]);
+
+  const handleSelectYesterday = useCallback(() => {
+    if (yesterdayIds.length === 0) {
+      const msg = 'No sales slips recorded for Yesterday.';
+      if (Platform.OS === 'web') window.alert(msg);
+      else Alert.alert('No Slips Yesterday', msg);
+      return;
+    }
+    setSearch('');
+    setStatusFilter('all');
+    setDateFilter('all');
+    setSelectionLabel('Yesterday');
+    setSelectedSaleIds(new Set(yesterdayIds));
+  }, [yesterdayIds]);
+
+  const handleSelectAllVisible = useCallback(() => {
+    if (filteredSales.length === 0) return;
+    setSelectionLabel('All');
+    setSelectedSaleIds(new Set(filteredSales.map((s) => s.id)));
+  }, [filteredSales]);
+
+  const handleClearSelection = useCallback(() => {
+    setSelectionLabel('Selected');
+    setSelectedSaleIds(new Set());
+  }, []);
+
+  const handleShareSelectedPdf = useCallback(async () => {
+    if (selectedSaleIds.size === 0) {
+      const msg = 'Please select at least one sales slip first.';
+      if (Platform.OS === 'web') window.alert(msg);
+      else Alert.alert('No Slips Selected', msg);
+      return;
+    }
+
+    // Preserve visible/chronological list order
+    const orderedIds = salesHistory
+      .filter((s) => selectedSaleIds.has(s.id))
+      .map((s) => s.id);
+
+    if (orderedIds.length === 0) return;
+
+    setExportingPdf(true);
+    try {
+      const fullSales = await wholesalerService.getSalesDetailsBatch(orderedIds);
+      const summaryById = new Map(salesHistory.map((s) => [s.id, s]));
+
+      const pdfSlips: PdfSalesSlipData[] =
+        fullSales.length > 0
+          ? fullSales.map((detail) => ({
+              id: detail.id,
+              receipt_no: detail.receipt_no,
+              customer_name_snapshot: detail.customer_name_snapshot || 'Walk-in Customer',
+              customer_phone_snapshot: detail.customer_phone_snapshot || null,
+              sale_date: detail.sale_date,
+              subtotal: Number(detail.subtotal || 0),
+              discount: Number(detail.discount || 0),
+              total_amount: Number(detail.total_amount || 0),
+              paid_amount: Number(detail.paid_amount || 0),
+              balance_due: Number(detail.balance_due || 0),
+              payment_method: detail.payment_method || 'cash',
+              items: detail.items || [],
+            }))
+          : orderedIds
+              .map((id) => summaryById.get(id))
+              .filter((s): s is WholesalerSaleSummary => Boolean(s))
+              .map((s) => ({
+                id: s.id,
+                receipt_no: s.receipt_no,
+                customer_name_snapshot: s.customer_name_snapshot || 'Walk-in Customer',
+                customer_phone_snapshot: s.customer_phone_snapshot || null,
+                sale_date: s.sale_date,
+                subtotal: Number(s.total_amount || 0),
+                discount: 0,
+                total_amount: Number(s.total_amount || 0),
+                paid_amount: Number(s.paid_amount || 0),
+                balance_due: Number(s.balance_due || 0),
+                payment_method: s.payment_method || 'cash',
+                items: [],
+              }));
+
+      await shareSalesSlipsPdf({
+        slips: pdfSlips,
+        slipsPerPage,
+        label: selectionLabel,
+      });
+    } catch (err: any) {
+      const msg = err?.message || 'Failed to generate or share PDF.';
+      if (Platform.OS === 'web') window.alert(msg);
+      else Alert.alert('PDF Export Failed', msg);
+    } finally {
+      setExportingPdf(false);
+    }
+  }, [selectedSaleIds, salesHistory, slipsPerPage, selectionLabel]);
+
+  const selectedCount = selectedSaleIds.size;
+  const estimatedPages = selectedCount > 0 ? Math.ceil(selectedCount / slipsPerPage) : 0;
 
   return (
     <Screen title="Orders & Invoices" scroll={false}>
@@ -793,174 +986,353 @@ export default function OrdersAndSlipsScreen() {
           />
         ) : (
           // SECTION 2: SALES SLIPS & INVOICES
-          <FlatList
-            data={filteredSales}
-            keyExtractor={(item) => item.id}
-            renderItem={({ item }) => (
-              <SalesSlipCard
-                item={item}
-                primaryColor={colors.primary}
-                successColor={colors.success}
-                errorColor={colors.error}
-                onOpenReceipt={handleOpenReceipt}
-              />
-            )}
-            initialNumToRender={8}
-            maxToRenderPerBatch={10}
-            windowSize={5}
-            removeClippedSubviews={Platform.OS !== 'web'}
-            contentContainerStyle={{ flexGrow: 1, paddingBottom: 60 }}
-            refreshControl={
-              <RefreshControl
-                refreshing={refreshing}
-                onRefresh={onRefresh}
-                colors={[colors.primary]}
-                tintColor={colors.primary}
-              />
-            }
-            ListHeaderComponent={
-              <View style={{ marginBottom: 4 }}>
-                {/* Search Bar */}
-                <View style={[styles.searchBar, { borderColor: colors.border, backgroundColor: colors.surface }]}>
-                  <Ionicons name="search-outline" size={18} color={colors.textMuted} style={{ marginRight: 8 }} />
-                  <TextInput
-                    placeholder="Search slip # or shop..."
-                    placeholderTextColor={colors.textMuted}
-                    value={search}
-                    onChangeText={setSearch}
-                    style={[styles.searchInput, { color: colors.text }]}
-                  />
-                  {search.length > 0 && (
-                    <Pressable onPress={() => setSearch('')} hitSlop={10}>
-                      <Ionicons name="close-circle" size={18} color={colors.textMuted} />
-                    </Pressable>
-                  )}
+          <View style={{ flex: 1 }}>
+            {isSelectionMode && (
+              <View style={styles.selectionHeaderBar}>
+                <View style={styles.selectionHeaderTopRow}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', flex: 1 }}>
+                    <Ionicons name="documents-outline" size={17} color={colors.primary} style={{ marginRight: 6 }} />
+                    <AppText style={[styles.boldText, { fontSize: 13, color: '#0f172a' }]}>
+                      Select Slips for PDF
+                    </AppText>
+                    <View style={[styles.selectedCountPill, { backgroundColor: colors.primary }]}>
+                      <AppText style={styles.selectedCountPillText}>{selectedCount}</AppText>
+                    </View>
+                  </View>
+                  <Pressable onPress={handleExitSelectionMode} hitSlop={8} style={styles.cancelSelectBtn}>
+                    <AppText style={styles.cancelSelectBtnText}>Done</AppText>
+                  </Pressable>
                 </View>
 
-                {/* Status Filter Chips */}
                 <ScrollView
                   horizontal
                   showsHorizontalScrollIndicator={false}
-                  contentContainerStyle={styles.filterScroll}
-                  style={{ maxHeight: 38, marginBottom: 6 }}
+                  contentContainerStyle={styles.presetRow}
                 >
-                  {[
-                    { key: 'all', label: `All (${counts.all})` },
-                    { key: 'due', label: `Credit / Due (${counts.due})`, highlight: counts.due > 0 },
-                    { key: 'paid', label: `Paid (${counts.paid})` },
-                    { key: 'partial', label: `Partial (${counts.partial})` },
-                  ].map((f) => {
-                    const isSel = statusFilter === f.key;
-                    return (
-                      <Pressable
-                        key={f.key}
-                        onPress={() => setStatusFilter(f.key as StatusFilter)}
-                        style={[
-                          styles.chip,
-                          isSel
-                            ? { backgroundColor: colors.primary, borderColor: colors.primary }
-                            : { borderColor: colors.border, backgroundColor: colors.surface },
-                        ]}
-                      >
-                        <AppText
-                          variant="caption"
-                          style={[
-                            styles.chipText,
-                            isSel ? { color: '#ffffff' } : { color: f.highlight ? colors.error : colors.text },
-                          ]}
-                        >
-                          {f.label}
-                        </AppText>
-                      </Pressable>
-                    );
-                  })}
-                </ScrollView>
-
-                {/* Date Range Filter Pills */}
-                <View style={styles.dateRow}>
-                  {[
-                    { key: 'all', label: 'All Dates' },
-                    { key: 'today', label: 'Today' },
-                    { key: 'week', label: 'This Week' },
-                    { key: 'month', label: 'This Month' },
-                  ].map((d) => {
-                    const isSel = dateFilter === d.key;
-                    return (
-                      <Pressable
-                        key={d.key}
-                        onPress={() => setDateFilter(d.key as DateFilter)}
-                        style={[
-                          styles.datePill,
-                          isSel
-                            ? { backgroundColor: colors.primary, borderColor: colors.primary }
-                            : { borderColor: colors.border, backgroundColor: '#f8fafc' },
-                        ]}
-                      >
-                        <AppText
-                          style={[
-                            styles.datePillText,
-                            isSel ? { color: '#ffffff', fontWeight: '700' } : { color: colors.textMuted },
-                          ]}
-                        >
-                          {d.label}
-                        </AppText>
-                      </Pressable>
-                    );
-                  })}
-                </View>
-
-                {/* Summary Strip */}
-                <View style={[styles.summaryStrip, { backgroundColor: '#f1f5f9' }]}>
-                  <View style={styles.summaryCol}>
-                    <AppText style={styles.miniLabel}>Slips</AppText>
-                    <AppText style={[styles.boldText, { fontSize: 13 }]}>{filteredSales.length}</AppText>
-                  </View>
-                  <View style={styles.summaryDivider} />
-                  <View style={styles.summaryCol}>
-                    <AppText style={styles.miniLabel}>Total Value</AppText>
-                    <AppText style={[styles.boldText, { color: colors.primary, fontSize: 13 }]} numberOfLines={1}>
-                      {formatMoney(totals.sales)}
-                    </AppText>
-                  </View>
-                  <View style={styles.summaryDivider} />
-                  <View style={[styles.summaryCol, { alignItems: 'flex-end' }]}>
-                    <AppText style={styles.miniLabel}>Total Due</AppText>
+                  <Pressable
+                    onPress={handleSelectToday}
+                    style={[
+                      styles.presetChip,
+                      selectionLabel === 'Today' && selectedCount > 0 && {
+                        backgroundColor: colors.primary,
+                        borderColor: colors.primary,
+                      },
+                    ]}
+                  >
                     <AppText
                       style={[
-                        styles.boldText,
-                        { fontSize: 13, color: totals.due > 0 ? colors.error : colors.success },
+                        styles.presetChipText,
+                        selectionLabel === 'Today' && selectedCount > 0 && { color: '#ffffff' },
                       ]}
-                      numberOfLines={1}
                     >
-                      {formatMoney(totals.due)}
-                    </AppText>
-                  </View>
-                </View>
-              </View>
-            }
-            ListEmptyComponent={
-              <Card style={styles.emptyCard}>
-                <Ionicons name="receipt-outline" size={42} color={colors.textMuted} />
-                <AppText variant="body" style={[styles.boldText, { marginTop: 12 }]}>
-                  {salesHistory.length === 0 ? 'No sales slips recorded yet' : 'No matching sales slips found'}
-                </AppText>
-                {hasActiveFilters && (
-                  <Pressable
-                    style={[styles.resetBtn, { borderColor: colors.primary }]}
-                    onPress={() => {
-                      setSearch('');
-                      setStatusFilter('all');
-                      setDateFilter('all');
-                    }}
-                  >
-                    <AppText variant="caption" style={[styles.boldText, { color: colors.primary }]}>
-                      Reset All Filters
+                      Today ({todayIds.length})
                     </AppText>
                   </Pressable>
-                )}
-              </Card>
-            }
-          />
+
+                  <Pressable
+                    onPress={handleSelectYesterday}
+                    style={[
+                      styles.presetChip,
+                      selectionLabel === 'Yesterday' && selectedCount > 0 && {
+                        backgroundColor: colors.primary,
+                        borderColor: colors.primary,
+                      },
+                    ]}
+                  >
+                    <AppText
+                      style={[
+                        styles.presetChipText,
+                        selectionLabel === 'Yesterday' && selectedCount > 0 && { color: '#ffffff' },
+                      ]}
+                    >
+                      Yesterday ({yesterdayIds.length})
+                    </AppText>
+                  </Pressable>
+
+                  <Pressable
+                    onPress={handleSelectAllVisible}
+                    style={[
+                      styles.presetChip,
+                      selectionLabel === 'All' && selectedCount > 0 && {
+                        backgroundColor: colors.primary,
+                        borderColor: colors.primary,
+                      },
+                    ]}
+                  >
+                    <AppText
+                      style={[
+                        styles.presetChipText,
+                        selectionLabel === 'All' && selectedCount > 0 && { color: '#ffffff' },
+                      ]}
+                    >
+                      Select All ({filteredSales.length})
+                    </AppText>
+                  </Pressable>
+
+                  {selectedCount > 0 && (
+                    <Pressable onPress={handleClearSelection} style={styles.clearPresetChip}>
+                      <AppText style={styles.clearPresetChipText}>Clear</AppText>
+                    </Pressable>
+                  )}
+                </ScrollView>
+              </View>
+            )}
+
+            <FlatList
+              data={filteredSales}
+              keyExtractor={(item) => item.id}
+              extraData={{ isSelectionMode, selectedSaleIds }}
+              renderItem={({ item }) => (
+                <SalesSlipCard
+                  item={item}
+                  primaryColor={colors.primary}
+                  successColor={colors.success}
+                  errorColor={colors.error}
+                  selectionMode={isSelectionMode}
+                  isSelected={selectedSaleIds.has(item.id)}
+                  onOpenReceipt={handleOpenReceipt}
+                  onToggleSelect={handleToggleSaleSelect}
+                  onLongPressSelect={handleEnterSelectionMode}
+                />
+              )}
+              initialNumToRender={8}
+              maxToRenderPerBatch={10}
+              windowSize={5}
+              removeClippedSubviews={Platform.OS !== 'web'}
+              contentContainerStyle={{ flexGrow: 1, paddingBottom: isSelectionMode ? 120 : 60 }}
+              refreshControl={
+                <RefreshControl
+                  refreshing={refreshing}
+                  onRefresh={onRefresh}
+                  colors={[colors.primary]}
+                  tintColor={colors.primary}
+                />
+              }
+              ListHeaderComponent={
+                <View style={{ marginBottom: 4 }}>
+                  {/* Search Bar */}
+                  <View style={[styles.searchBar, { borderColor: colors.border, backgroundColor: colors.surface }]}>
+                    <Ionicons name="search-outline" size={18} color={colors.textMuted} style={{ marginRight: 8 }} />
+                    <TextInput
+                      placeholder="Search slip # or shop..."
+                      placeholderTextColor={colors.textMuted}
+                      value={search}
+                      onChangeText={setSearch}
+                      style={[styles.searchInput, { color: colors.text }]}
+                    />
+                    {search.length > 0 && (
+                      <Pressable onPress={() => setSearch('')} hitSlop={10}>
+                        <Ionicons name="close-circle" size={18} color={colors.textMuted} />
+                      </Pressable>
+                    )}
+                  </View>
+
+                  {/* Status Filter Chips */}
+                  <ScrollView
+                    horizontal
+                    showsHorizontalScrollIndicator={false}
+                    contentContainerStyle={styles.filterScroll}
+                    style={{ maxHeight: 38, marginBottom: 6 }}
+                  >
+                    {[
+                      { key: 'all', label: `All (${counts.all})` },
+                      { key: 'due', label: `Credit / Due (${counts.due})`, highlight: counts.due > 0 },
+                      { key: 'paid', label: `Paid (${counts.paid})` },
+                      { key: 'partial', label: `Partial (${counts.partial})` },
+                    ].map((f) => {
+                      const isSel = statusFilter === f.key;
+                      return (
+                        <Pressable
+                          key={f.key}
+                          onPress={() => setStatusFilter(f.key as StatusFilter)}
+                          style={[
+                            styles.chip,
+                            isSel
+                              ? { backgroundColor: colors.primary, borderColor: colors.primary }
+                              : { borderColor: colors.border, backgroundColor: colors.surface },
+                          ]}
+                        >
+                          <AppText
+                            variant="caption"
+                            style={[
+                              styles.chipText,
+                              isSel ? { color: '#ffffff' } : { color: f.highlight ? colors.error : colors.text },
+                            ]}
+                          >
+                            {f.label}
+                          </AppText>
+                        </Pressable>
+                      );
+                    })}
+                  </ScrollView>
+
+                  {/* Date Range Filter Pills */}
+                  <View style={styles.dateRow}>
+                    {[
+                      { key: 'all', label: 'All Dates' },
+                      { key: 'today', label: 'Today' },
+                      { key: 'week', label: 'This Week' },
+                      { key: 'month', label: 'This Month' },
+                    ].map((d) => {
+                      const isSel = dateFilter === d.key;
+                      return (
+                        <Pressable
+                          key={d.key}
+                          onPress={() => setDateFilter(d.key as DateFilter)}
+                          style={[
+                            styles.datePill,
+                            isSel
+                              ? { backgroundColor: colors.primary, borderColor: colors.primary }
+                              : { borderColor: colors.border, backgroundColor: '#f8fafc' },
+                          ]}
+                        >
+                          <AppText
+                            style={[
+                              styles.datePillText,
+                              isSel ? { color: '#ffffff', fontWeight: '700' } : { color: colors.textMuted },
+                            ]}
+                          >
+                            {d.label}
+                          </AppText>
+                        </Pressable>
+                      );
+                    })}
+                  </View>
+
+                  {/* Summary Strip */}
+                  <View style={[styles.summaryStrip, { backgroundColor: '#f1f5f9' }]}>
+                    <View style={styles.summaryCol}>
+                      <AppText style={styles.miniLabel}>Slips</AppText>
+                      <AppText style={[styles.boldText, { fontSize: 13 }]}>{filteredSales.length}</AppText>
+                    </View>
+                    <View style={styles.summaryDivider} />
+                    <View style={styles.summaryCol}>
+                      <AppText style={styles.miniLabel}>Total Value</AppText>
+                      <AppText style={[styles.boldText, { color: colors.primary, fontSize: 13 }]} numberOfLines={1}>
+                        {formatMoney(totals.sales)}
+                      </AppText>
+                    </View>
+                    <View style={styles.summaryDivider} />
+                    <View style={[styles.summaryCol, { alignItems: 'flex-end' }]}>
+                      <AppText style={styles.miniLabel}>Total Due</AppText>
+                      <AppText
+                        style={[
+                          styles.boldText,
+                          { fontSize: 13, color: totals.due > 0 ? colors.error : colors.success },
+                        ]}
+                        numberOfLines={1}
+                      >
+                        {formatMoney(totals.due)}
+                      </AppText>
+                    </View>
+                  </View>
+
+                  {/* Multi-Slip PDF Share Bar Trigger */}
+                  {!isSelectionMode && salesHistory.length > 0 && (
+                    <View style={styles.batchLaunchRow}>
+                      <AppText variant="caption" muted style={{ flex: 1, fontSize: 11 }}>
+                        Tap any slip to view, or select multiple for A4 PDF
+                      </AppText>
+                      <Pressable
+                        onPress={() => handleEnterSelectionMode()}
+                        style={({ pressed }) => [styles.batchShareLaunchBtn, pressed && { opacity: 0.85 }]}
+                      >
+                        <Ionicons name="document-text-outline" size={14} color="#ffffff" style={{ marginRight: 5 }} />
+                        <AppText style={styles.batchShareLaunchText}>Select & Share PDF</AppText>
+                      </Pressable>
+                    </View>
+                  )}
+                </View>
+              }
+              ListEmptyComponent={
+                <Card style={styles.emptyCard}>
+                  <Ionicons name="receipt-outline" size={42} color={colors.textMuted} />
+                  <AppText variant="body" style={[styles.boldText, { marginTop: 12 }]}>
+                    {salesHistory.length === 0 ? 'No sales slips recorded yet' : 'No matching sales slips found'}
+                  </AppText>
+                  {hasActiveFilters && (
+                    <Pressable
+                      style={[styles.resetBtn, { borderColor: colors.primary }]}
+                      onPress={() => {
+                        setSearch('');
+                        setStatusFilter('all');
+                        setDateFilter('all');
+                      }}
+                    >
+                      <AppText variant="caption" style={[styles.boldText, { color: colors.primary }]}>
+                        Reset All Filters
+                      </AppText>
+                    </Pressable>
+                  )}
+                </Card>
+              }
+            />
+
+            {/* Sticky Bottom Bar for A4 Layout Config & Batch PDF Export */}
+            {isSelectionMode && (
+              <View style={styles.pdfBottomBar}>
+                <View style={styles.a4LayoutRow}>
+                  <AppText style={styles.a4LayoutLabel}>Slips per A4 Paper:</AppText>
+                  <View style={styles.a4PillsGroup}>
+                    {([2, 4, 6] as SlipsPerPageOption[]).map((opt) => {
+                      const active = slipsPerPage === opt;
+                      return (
+                        <Pressable
+                          key={opt}
+                          onPress={() => setSlipsPerPage(opt)}
+                          style={[
+                            styles.a4OptionPill,
+                            active && { backgroundColor: colors.primary, borderColor: colors.primary },
+                          ]}
+                        >
+                          <AppText
+                            style={[
+                              styles.a4OptionPillText,
+                              active && { color: '#ffffff', fontWeight: '700' },
+                            ]}
+                          >
+                            {opt} / A4
+                          </AppText>
+                        </Pressable>
+                      );
+                    })}
+                  </View>
+                </View>
+
+                <View style={styles.pdfShareActionRow}>
+                  <View style={{ flex: 1 }}>
+                    <AppText style={styles.pdfCountTitle}>
+                      {selectedCount} Slip{selectedCount === 1 ? '' : 's'} Selected
+                    </AppText>
+                    <AppText variant="caption" muted style={{ fontSize: 11 }}>
+                      {estimatedPages > 0
+                        ? `${estimatedPages} A4 page${estimatedPages === 1 ? '' : 's'} (${slipsPerPage} slips/sheet)`
+                        : 'Select Today, Yesterday, All, or tap slips'}
+                    </AppText>
+                  </View>
+
+                  <Pressable
+                    disabled={selectedCount === 0 || exportingPdf}
+                    onPress={handleShareSelectedPdf}
+                    style={({ pressed }) => [
+                      styles.sharePdfBtn,
+                      (selectedCount === 0 || exportingPdf) && { opacity: 0.55 },
+                      pressed && { opacity: 0.85 },
+                    ]}
+                  >
+                    {exportingPdf ? (
+                      <ActivityIndicator size="small" color="#ffffff" style={{ marginRight: 6 }} />
+                    ) : (
+                      <Ionicons name="share-social-outline" size={17} color="#ffffff" style={{ marginRight: 6 }} />
+                    )}
+                    <AppText style={styles.sharePdfBtnText}>
+                      {exportingPdf ? 'Creating PDF...' : 'Share PDF'}
+                    </AppText>
+                  </Pressable>
+                </View>
+              </View>
+            )}
+          </View>
         )}
 
         {/* Incoming Order Detail Modal */}
@@ -1312,5 +1684,162 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     borderRadius: 6,
     borderWidth: 1,
+  },
+  batchLaunchRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 8,
+    marginBottom: 8,
+  },
+  batchShareLaunchBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#059669',
+    paddingVertical: 7,
+    paddingHorizontal: 11,
+    borderRadius: 8,
+  },
+  batchShareLaunchText: {
+    color: '#ffffff',
+    fontSize: 12,
+    fontWeight: '700',
+  },
+  selectionHeaderBar: {
+    backgroundColor: '#eff6ff',
+    borderWidth: 1,
+    borderColor: '#bfdbfe',
+    borderRadius: 10,
+    padding: 10,
+    marginBottom: 8,
+  },
+  selectionHeaderTopRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 8,
+  },
+  selectedCountPill: {
+    marginLeft: 8,
+    paddingHorizontal: 7,
+    paddingVertical: 2,
+    borderRadius: 10,
+    minWidth: 22,
+    alignItems: 'center',
+  },
+  selectedCountPillText: {
+    color: '#ffffff',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  cancelSelectBtn: {
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 6,
+    backgroundColor: '#ffffff',
+    borderWidth: 1,
+    borderColor: '#cbd5e1',
+  },
+  cancelSelectBtnText: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#334155',
+  },
+  presetRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  presetChip: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 16,
+    backgroundColor: '#ffffff',
+    borderWidth: 1,
+    borderColor: '#cbd5e1',
+  },
+  presetChipText: {
+    fontSize: 11.5,
+    fontWeight: '600',
+    color: '#1e293b',
+  },
+  clearPresetChip: {
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderRadius: 16,
+    backgroundColor: '#fef2f2',
+    borderWidth: 1,
+    borderColor: '#fecaca',
+  },
+  clearPresetChipText: {
+    fontSize: 11.5,
+    fontWeight: '700',
+    color: '#dc2626',
+  },
+  pdfBottomBar: {
+    backgroundColor: '#ffffff',
+    borderTopWidth: 1,
+    borderColor: '#cbd5e1',
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 6,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: -2 },
+    shadowOpacity: 0.08,
+    shadowRadius: 6,
+    elevation: 6,
+  },
+  a4LayoutRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 10,
+  },
+  a4LayoutLabel: {
+    fontSize: 12,
+    fontWeight: '700',
+    color: '#334155',
+  },
+  a4PillsGroup: {
+    flexDirection: 'row',
+    gap: 6,
+  },
+  a4OptionPill: {
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: '#cbd5e1',
+    backgroundColor: '#f8fafc',
+  },
+  a4OptionPillText: {
+    fontSize: 11.5,
+    fontWeight: '600',
+    color: '#334155',
+  },
+  pdfShareActionRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
+  },
+  pdfCountTitle: {
+    fontSize: 13.5,
+    fontWeight: '800',
+    color: '#0f172a',
+  },
+  sharePdfBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#059669',
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 10,
+  },
+  sharePdfBtnText: {
+    color: '#ffffff',
+    fontSize: 13,
+    fontWeight: '700',
   },
 });

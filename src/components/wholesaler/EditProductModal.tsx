@@ -93,15 +93,20 @@ function EditProductForm({
     }
 
     const price = parseFloat(salePrice);
-    if (!price || price <= 0) {
+    if (!Number.isFinite(price) || price <= 0) {
       Alert.alert('Invalid Price', 'Please enter a valid wholesale selling price per carton.');
       return;
     }
 
-    const cost = parseFloat(costPrice) || 0;
-    const piecesVal = parseInt(pieces, 10) || 1;
-    const uSale = unitSalePrice ? parseFloat(unitSalePrice) : Math.round((price / piecesVal) * 100) / 100;
-    const thresh = parseInt(lowStockThreshold, 10) || 24;
+    const parsedCost = parseFloat(costPrice);
+    const cost = Number.isFinite(parsedCost) && parsedCost >= 0 ? parsedCost : 0;
+    const piecesVal = Math.max(1, parseInt(pieces, 10) || 1);
+    const parsedUnitSale = parseFloat(unitSalePrice);
+    const uSale =
+      Number.isFinite(parsedUnitSale) && parsedUnitSale > 0
+        ? parsedUnitSale
+        : Math.round((price / piecesVal) * 100) / 100;
+    const thresh = Math.max(0, parseInt(lowStockThreshold, 10) || 24);
 
     try {
       setLoading(true);

@@ -9272,3 +9272,94 @@ GRANT EXECUTE ON FUNCTION public.admin_danger_delete_store(uuid) TO authenticate
 GRANT EXECUTE ON FUNCTION public.admin_danger_delete_user(uuid) TO authenticated, service_role, anon;
 GRANT EXECUTE ON FUNCTION public.admin_danger_delete_inventory(uuid) TO authenticated, service_role, anon;
 GRANT EXECUTE ON FUNCTION public.admin_danger_delete_sale(uuid) TO authenticated, service_role, anon;
+
+
+-- ==============================================================================
+-- MIGRATION: 20261111000001_fix_product_variants_sale_unit_default.sql
+-- DESCRIPTION: Default sale_unit on product_variants & clean orphan products
+-- ==============================================================================
+
+ALTER TABLE public.product_variants
+  ALTER COLUMN sale_unit SET DEFAULT 'carton'::public.sale_unit_enum;
+
+CREATE OR REPLACE FUNCTION public.ensure_product_variant_sale_unit()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  v_pkg text;
+BEGIN
+  IF NEW.sale_unit IS NULL THEN
+    v_pkg := lower(trim(coalesce(NEW.packaging_type, 'carton')));
+    NEW.sale_unit := CASE
+      WHEN v_pkg IN ('carton', 'case', 'shrink', 'pack', 'single') THEN v_pkg::public.sale_unit_enum
+      WHEN v_pkg IN ('crate', 'tray', 'box') THEN 'case'::public.sale_unit_enum
+      WHEN v_pkg IN ('bottle', 'can', 'unit', 'piece') THEN 'single'::public.sale_unit_enum
+      ELSE 'carton'::public.sale_unit_enum
+    END;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_ensure_product_variant_sale_unit ON public.product_variants;
+CREATE TRIGGER trg_ensure_product_variant_sale_unit
+  BEFORE INSERT OR UPDATE ON public.product_variants
+  FOR EACH ROW
+  EXECUTE FUNCTION public.ensure_product_variant_sale_unit();
+
+DELETE FROM public.products p
+WHERE NOT EXISTS (
+  SELECT 1 FROM public.product_variants pv WHERE pv.product_id = p.id
+);
+
+GRANT SELECT ON public.categories, public.brands TO anon, authenticated, service_role;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.products, public.product_variants, public.inventory TO authenticated, service_role;
+
+
+-- ==============================================================================
+-- MIGRATION: 20261111000002_fix_danger_delete_inventory_reservations.sql
+-- DESCRIPTION: Include stock_reservations in admin_danger_delete_inventory RPC
+-- ==============================================================================
+
+CREATE OR REPLACE FUNCTION public.admin_danger_delete_inventory(p_product_id uuid)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_variant_ids uuid[];
+BEGIN
+  SELECT array_agg(id) INTO v_variant_ids
+  FROM public.product_variants
+  WHERE product_id = p_product_id;
+
+  IF v_variant_ids IS NOT NULL AND array_length(v_variant_ids, 1) > 0 THEN
+    DELETE FROM public.inventory WHERE variant_id = ANY(v_variant_ids);
+    DELETE FROM public.stock_movements WHERE variant_id = ANY(v_variant_ids);
+    DELETE FROM public.stock_adjustments WHERE variant_id = ANY(v_variant_ids);
+    DELETE FROM public.sale_items WHERE variant_id = ANY(v_variant_ids);
+    DELETE FROM public.purchase_items WHERE variant_id = ANY(v_variant_ids);
+    DELETE FROM public.order_items WHERE variant_id = ANY(v_variant_ids);
+
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'stock_reservations' AND table_schema = 'public') THEN
+      DELETE FROM public.stock_reservations WHERE variant_id = ANY(v_variant_ids);
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'cart_items' AND table_schema = 'public') THEN
+      DELETE FROM public.cart_items WHERE variant_id = ANY(v_variant_ids);
+    END IF;
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'price_list_items' AND table_schema = 'public') THEN
+      DELETE FROM public.price_list_items WHERE variant_id = ANY(v_variant_ids);
+    END IF;
+
+    DELETE FROM public.product_variants WHERE product_id = p_product_id;
+  END IF;
+
+  DELETE FROM public.products WHERE id = p_product_id;
+
+  RETURN jsonb_build_object('success', true, 'message', format('Product %s purged successfully', p_product_id));
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.admin_danger_delete_inventory(uuid) TO authenticated, service_role, anon;

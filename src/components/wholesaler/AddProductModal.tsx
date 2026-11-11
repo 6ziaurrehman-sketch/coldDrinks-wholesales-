@@ -65,14 +65,19 @@ export function AddProductModal({ visible, onClose, onSubmit }: AddProductModalP
       Alert.alert('Required Field', 'Please enter a product name (e.g. Pepsi, Coke, Gourmet Cola).');
       return;
     }
-    const cost = parseFloat(costPrice) || 0;
-    const price = parseFloat(salePrice) || 0;
-    if (price <= 0) {
+    const parsedCost = parseFloat(costPrice);
+    const cost = Number.isFinite(parsedCost) && parsedCost >= 0 ? parsedCost : 0;
+    const price = parseFloat(salePrice);
+    if (!Number.isFinite(price) || price <= 0) {
       Alert.alert('Invalid Price', 'Please enter a valid wholesale selling price per carton/pack.');
       return;
     }
-    const piecesVal = parseInt(pieces, 10) || 1;
-    const uSale = unitSalePrice ? parseFloat(unitSalePrice) : Math.round((price / piecesVal) * 100) / 100;
+    const piecesVal = Math.max(1, parseInt(pieces, 10) || 1);
+    const parsedUnitSale = parseFloat(unitSalePrice);
+    const uSale =
+      Number.isFinite(parsedUnitSale) && parsedUnitSale > 0
+        ? parsedUnitSale
+        : Math.round((price / piecesVal) * 100) / 100;
 
     try {
       setLoading(true);

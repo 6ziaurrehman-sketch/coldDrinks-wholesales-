@@ -1,6 +1,11 @@
 import assert from 'node:assert';
 import { describe, it } from 'node:test';
 import { matchInventoryItem, matchCustomer, matchSalesSlip } from '../src/utils/searchUtils.ts';
+import {
+  buildSalesSlipsPdf,
+  getKarachiDateKey,
+  getTodayAndYesterdayKeys,
+} from '../src/utils/salesSlipPdfGenerator.ts';
 
 // FormatMoney implementation test
 const DEFAULT_CURRENCY = 'PKR';
@@ -5023,6 +5028,81 @@ describe('Smart Beverage & Carton Search Engine (Spacing, Case, Carton Synonyms)
     assert.strictEqual(matchSalesSlip(sale, 'slip 42'), true);
     assert.strictEqual(matchSalesSlip(sale, 'al rehman'), true);
     assert.strictEqual(matchSalesSlip(sale, 'credit'), true);
+  });
+});
+
+describe('Batch A4 Sales Slips PDF Generator', () => {
+  const makeSlips = (count) =>
+    Array.from({ length: count }, (_, idx) => ({
+      id: `sale-${idx + 1}`,
+      receipt_no: `SLIP-2026-${String(idx + 1).padStart(4, '0')}`,
+      customer_name_snapshot: `Shop #${idx + 1} (Al-Rehman \\ Co.)`,
+      customer_phone_snapshot: '0300-1234567',
+      sale_date: '2026-11-11T12:00:00Z',
+      subtotal: 6000,
+      discount: idx % 2 === 0 ? 500 : 0,
+      total_amount: idx % 2 === 0 ? 5500 : 6000,
+      paid_amount: idx % 3 === 0 ? 0 : idx % 3 === 1 ? 2000 : 5500,
+      balance_due: idx % 3 === 0 ? 5500 : idx % 3 === 1 ? 4000 : 0,
+      payment_method: idx % 3 === 0 ? 'credit' : 'cash',
+      items: Array.from({ length: idx === 0 ? 18 : 3 }, (__, j) => ({
+        product_name_snapshot: `Pepsi Drink ${j + 1}`,
+        size_label_snapshot: '1.5L',
+        cartons_qty: 2,
+        loose_units_qty: j % 2,
+        line_total: 2000,
+      })),
+    }));
+
+  it('paginates multiple A4 pages cleanly for 4 (default), 6, and 2 slips per sheet', () => {
+    const res4 = buildSalesSlipsPdf(makeSlips(9), 4);
+    assert.strictEqual(res4.pageCount, 3);
+    const txt4 = Buffer.from(res4.bytes).toString('latin1');
+    assert.ok(txt4.startsWith('%PDF-1.4\n'));
+    assert.ok(txt4.includes('/Count 3'));
+    assert.ok(txt4.includes('/MediaBox [0 0 595.28 841.89]'));
+    assert.ok(txt4.trimEnd().endsWith('%%EOF'));
+
+    const res6 = buildSalesSlipsPdf(makeSlips(7), 6);
+    assert.strictEqual(res6.pageCount, 2);
+    const txt6 = Buffer.from(res6.bytes).toString('latin1');
+    assert.ok(txt6.includes('/Count 2'));
+    assert.ok(txt6.includes('6 Slips/A4'));
+
+    const res2 = buildSalesSlipsPdf(makeSlips(3), 2);
+    assert.strictEqual(res2.pageCount, 2);
+    const txt2 = Buffer.from(res2.bytes).toString('latin1');
+    assert.ok(txt2.includes('/Count 2'));
+    assert.ok(txt2.includes('2 Slips/A4'));
+  });
+
+  it('produces valid exact byte offsets in xref table and handles overflow items', () => {
+    const { bytes } = buildSalesSlipsPdf(makeSlips(5), 4);
+    const txt = Buffer.from(bytes).toString('latin1');
+    const xrefIdx = txt.indexOf('xref\n');
+    const startxrefMatch = /startxref\n(\d+)\n%%EOF/.exec(txt);
+    assert.ok(startxrefMatch, 'Missing startxref');
+    assert.strictEqual(Number(startxrefMatch[1]), xrefIdx);
+
+    // Every object entry offset in xref must point directly to "N 0 obj"
+    const entryMatches = [...txt.slice(xrefIdx).matchAll(/^(\d{10}) 00000 n $/gm)];
+    assert.strictEqual(entryMatches.length, 8); // Catalog, Pages, 2 Fonts, 2 Pages, 2 Content streams
+    entryMatches.forEach((m, i) => {
+      const offset = Number(m[1]);
+      assert.ok(
+        txt.slice(offset, offset + 12).startsWith(`${i + 1} 0 obj`),
+        `Object ${i + 1} offset mismatch at ${offset}`
+      );
+    });
+  });
+
+  it('computes Today and Yesterday date keys in Asia/Karachi timezone', () => {
+    // 2026-11-11 20:00 UTC is 2026-11-12 01:00 PKT (Asia/Karachi is UTC+5)
+    const lateUtc = new Date('2026-11-11T20:00:00Z');
+    assert.strictEqual(getKarachiDateKey(lateUtc), '2026-11-12');
+    const { todayKey, yesterdayKey } = getTodayAndYesterdayKeys(lateUtc);
+    assert.strictEqual(todayKey, '2026-11-12');
+    assert.strictEqual(yesterdayKey, '2026-11-11');
   });
 });
 
