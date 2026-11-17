@@ -11,6 +11,7 @@ import { formatMoney } from '@/utils/formatMoney';
 interface RecordPaymentModalProps {
   visible: boolean;
   customers: WholesalerCustomer[];
+  initialCustomerId?: string;
   onClose: () => void;
   onSubmit: (params: {
     customerId: string;
@@ -21,15 +22,38 @@ interface RecordPaymentModalProps {
   }) => Promise<void>;
 }
 
-export function RecordPaymentModal({ visible, customers, onClose, onSubmit }: RecordPaymentModalProps) {
+export function RecordPaymentModal({
+  visible,
+  customers,
+  initialCustomerId,
+  onClose,
+  onSubmit,
+}: RecordPaymentModalProps) {
   const { colors } = useTheme();
 
-  const [selectedCustomerId, setSelectedCustomerId] = useState<string>(customers[0]?.id || '');
+  const [selectedCustomerId, setSelectedCustomerId] = useState<string>(
+    initialCustomerId || customers[0]?.id || ''
+  );
   const [amount, setAmount] = useState('');
   const [paymentMethod, setPaymentMethod] = useState<'cash' | 'bank_transfer' | 'cheque'>('cash');
   const [refNo, setRefNo] = useState('');
   const [notes, setNotes] = useState('');
   const [loading, setLoading] = useState(false);
+
+  const [prevTrigger, setPrevTrigger] = useState<{ visible: boolean; id?: string }>({
+    visible,
+    id: initialCustomerId,
+  });
+
+  if (visible !== prevTrigger.visible || initialCustomerId !== prevTrigger.id) {
+    setPrevTrigger({ visible, id: initialCustomerId });
+    if (visible) {
+      const targetId = initialCustomerId || customers[0]?.id || '';
+      setSelectedCustomerId(targetId);
+      const cust = customers.find((c) => c.id === targetId);
+      setAmount(cust && cust.current_balance > 0 ? String(cust.current_balance) : '');
+    }
+  }
 
   const selectedCust = customers.find((c) => c.id === (selectedCustomerId || customers[0]?.id));
 
@@ -88,7 +112,12 @@ export function RecordPaymentModal({ visible, customers, onClose, onSubmit }: Re
               return (
                 <Pressable
                   key={c.id}
-                  onPress={() => setSelectedCustomerId(c.id)}
+                  onPress={() => {
+                    setSelectedCustomerId(c.id);
+                    if (c.current_balance > 0) {
+                      setAmount(String(c.current_balance));
+                    }
+                  }}
                   style={[
                     styles.chip,
                     sel ? { backgroundColor: colors.primary, borderColor: colors.primary } : { borderColor: colors.border },

@@ -394,6 +394,7 @@ export default function OrdersAndSlipsScreen() {
       const detail = await wholesalerService.getSaleDetail(sale.id);
       setReceiptItems(detail.items || []);
       setSelectedReceipt({
+        id: detail.id,
         sale_id: detail.id,
         receipt_no: detail.receipt_no,
         customer_name: detail.customer_name_snapshot,
@@ -410,7 +411,11 @@ export default function OrdersAndSlipsScreen() {
         notes: detail.notes,
       });
     } catch {
-      setSelectedReceipt(sale as any);
+      setSelectedReceipt({
+        ...sale,
+        id: sale.id,
+        sale_id: sale.id,
+      } as any);
       setReceiptItems([]);
     }
   }, []);
@@ -600,6 +605,7 @@ export default function OrdersAndSlipsScreen() {
               total_amount: Number(detail.total_amount || 0),
               paid_amount: Number(detail.paid_amount || 0),
               balance_due: Number(detail.balance_due || 0),
+              current_total_balance: Number(detail.balance_due || 0),
               payment_method: detail.payment_method || 'cash',
               items: detail.items || [],
             }))
@@ -617,6 +623,7 @@ export default function OrdersAndSlipsScreen() {
                 total_amount: Number(s.total_amount || 0),
                 paid_amount: Number(s.paid_amount || 0),
                 balance_due: Number(s.balance_due || 0),
+                current_total_balance: Number(s.balance_due || 0),
                 payment_method: s.payment_method || 'cash',
                 items: [],
               }));
@@ -1360,6 +1367,9 @@ export default function OrdersAndSlipsScreen() {
           receipt={selectedReceipt}
           items={receiptItems}
           onClose={() => setSelectedReceipt(null)}
+          onReversed={() => {
+            setSelectedReceipt(null);
+          }}
         />
 
         {/* Record Payment Modal */}

@@ -1,8 +1,3 @@
-import { useAddressStore } from '@/store/addressStore';
-import { useCartStore } from '@/store/cartStore';
-import { useShopStore } from '@/store/shopStore';
-import { useUiStore } from '@/store/uiStore';
-
 type StoreResetFn = () => void;
 const storeResets = new Set<StoreResetFn>();
 
@@ -18,6 +13,18 @@ export function registerStoreReset(resetFn: StoreResetFn) {
  * and clears session states on sign out.
  */
 export async function resetAllStores() {
+  const [
+    { useCartStore },
+    { useUiStore },
+    { useShopStore },
+    { useAddressStore },
+  ] = await Promise.all([
+    import('@/store/cartStore'),
+    import('@/store/uiStore'),
+    import('@/store/shopStore'),
+    import('@/store/addressStore'),
+  ]);
+
   // Reset cart
   useCartStore.getState().reset();
 

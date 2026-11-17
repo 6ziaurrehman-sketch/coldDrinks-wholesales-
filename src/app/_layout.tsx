@@ -1,7 +1,9 @@
 import { Stack } from 'expo-router';
 import * as SplashScreen from 'expo-splash-screen';
 import { StatusBar } from 'expo-status-bar';
-import { useEffect } from 'react';
+import * as Updates from 'expo-updates';
+import { useEffect, useRef } from 'react';
+import { Alert, AppState, Platform } from 'react-native';
 import { GestureHandlerRootView } from 'react-native-gesture-handler';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
@@ -25,6 +27,70 @@ function SplashController() {
       SplashScreen.hideAsync();
     }
   }, [isLoading]);
+
+  return null;
+}
+
+/**
+ * Checks for published EAS OTA updates on startup and foreground resume
+ * so users can immediately apply new updates instead of waiting for two restarts.
+ */
+function OtaUpdateController() {
+  const lastCheckAtRef = useRef(0);
+  const checkingRef = useRef(false);
+  const promptedRef = useRef(false);
+
+  useEffect(() => {
+    if (Platform.OS === 'web' || __DEV__ || !Updates.isEnabled) {
+      return;
+    }
+
+    const checkAndFetch = async () => {
+      const now = Date.now();
+      if (checkingRef.current || promptedRef.current || now - lastCheckAtRef.current < 60000) {
+        return;
+      }
+      checkingRef.current = true;
+      lastCheckAtRef.current = now;
+      try {
+        const update = await Updates.checkForUpdateAsync();
+        if (update.isAvailable) {
+          const fetched = await Updates.fetchUpdateAsync();
+          if (fetched.isNew && !promptedRef.current) {
+            promptedRef.current = true;
+            Alert.alert(
+              'Update Ready',
+              'A new update has been downloaded. Restart now to see the latest changes.',
+              [
+                { text: 'Later', style: 'cancel' },
+                {
+                  text: 'Restart Now',
+                  onPress: () => {
+                    void Updates.reloadAsync();
+                  },
+                },
+              ]
+            );
+          }
+        }
+      } catch {
+        // Ignore offline/Expo Go/rate-limit errors cleanly
+      } finally {
+        checkingRef.current = false;
+      }
+    };
+
+    void checkAndFetch();
+    const sub = AppState.addEventListener('change', (state) => {
+      if (state === 'active') {
+        void checkAndFetch();
+      }
+    });
+
+    return () => {
+      sub.remove();
+    };
+  }, []);
 
   return null;
 }
@@ -67,6 +133,7 @@ export default function RootLayout() {
         <ErrorBoundary>
           <SessionProvider>
             <SplashController />
+            <OtaUpdateController />
             <RootNavigator />
           </SessionProvider>
         </ErrorBoundary>

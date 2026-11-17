@@ -20,17 +20,20 @@ import { useTheme } from '@/theme/useTheme';
 import { formatMoney } from '@/utils/formatMoney';
 import { getDisplayName } from '@/utils/productUtils';
 import { WholesalerSaleReceipt } from '@/types/wholesaler.types';
+import { useWholesalerStore } from '@/store/wholesalerStore';
 
 interface SalesSlipModalProps {
   visible: boolean;
   receipt: WholesalerSaleReceipt | null;
   items?: any[];
   onClose: () => void;
+  onReversed?: (receiptNo: string) => void;
 }
 
-export function SalesSlipModal({ visible, receipt, items = [], onClose }: SalesSlipModalProps) {
+export function SalesSlipModal({ visible, receipt, items = [], onClose, onReversed }: SalesSlipModalProps) {
   const { colors, spacing } = useTheme();
   const [sharingImage, setSharingImage] = useState(false);
+  const [reversing, setReversing] = useState(false);
   const receiptCardRef = useRef<View>(null);
 
   if (!receipt) return null;
@@ -151,6 +154,60 @@ export function SalesSlipModal({ visible, receipt, items = [], onClose }: SalesS
       Alert.alert('Copied', 'Sales slip copied to clipboard. You can paste it into WhatsApp.');
     } catch {
       // Ignore clipboard error
+    }
+  };
+
+  const handleConfirmReverse = () => {
+    const saleId = (receipt as any).sale_id || (receipt as any).id;
+    if (!saleId) {
+      Alert.alert('Error', 'Sale identifier is missing.');
+      return;
+    }
+
+    const title = 'Reverse Sales Slip?';
+    const message = `Are you sure you want to reverse slip #${receipt.receipt_no}?\n\nThis will:\n• Cancel and delete this sales slip\n• Return all products back to stock inventory\n• Reverse customer balance & ledger records`;
+
+    if (Platform.OS === 'web' && typeof window !== 'undefined') {
+      if (window.confirm(`${title}\n\n${message}`)) {
+        void executeReversal(saleId);
+      }
+      return;
+    }
+
+    Alert.alert(title, message, [
+      { text: 'Keep Slip', style: 'cancel' },
+      {
+        text: 'Reverse & Delete',
+        style: 'destructive',
+        onPress: () => {
+          void executeReversal(saleId);
+        },
+      },
+    ]);
+  };
+
+  const executeReversal = async (saleId: string) => {
+    setReversing(true);
+    try {
+      await useWholesalerStore.getState().reverseSale(saleId);
+      if (Platform.OS === 'web' && typeof window !== 'undefined') {
+        window.alert(`Slip #${receipt.receipt_no} has been reversed and removed from the system.`);
+      } else {
+        Alert.alert(
+          'Sale Slip Reversed',
+          `Slip #${receipt.receipt_no} has been reversed, items returned to stock, and records removed.`
+        );
+      }
+      onClose();
+      onReversed?.(receipt.receipt_no);
+    } catch (err: any) {
+      console.error('Failed to reverse sale slip:', err);
+      Alert.alert(
+        'Reversal Failed',
+        err?.message || 'Could not reverse this sales slip. Please check your connection and try again.'
+      );
+    } finally {
+      setReversing(false);
     }
   };
 
@@ -321,28 +378,50 @@ export function SalesSlipModal({ visible, receipt, items = [], onClose }: SalesS
 
           {/* Action Buttons */}
           <View style={styles.modalActions}>
+            <View style={styles.actionRowPrimary}>
+              <Pressable
+                disabled={sharingImage || reversing}
+                style={[styles.sharePicBtn, (sharingImage || reversing) && { opacity: 0.7 }]}
+                onPress={handleShareImage}
+              >
+                {sharingImage ? (
+                  <ActivityIndicator size="small" color="#ffffff" style={{ marginRight: 6 }} />
+                ) : (
+                  <Ionicons name="image-outline" size={18} color="#ffffff" style={{ marginRight: 6 }} />
+                )}
+                <AppText style={styles.sharePicBtnText}>
+                  {sharingImage ? 'Creating Image...' : 'Share Picture (WhatsApp)'}
+                </AppText>
+              </Pressable>
+
+              <Pressable
+                disabled={reversing}
+                style={[styles.copyBtn, reversing && { opacity: 0.7 }]}
+                onPress={handleCopy}
+              >
+                <Ionicons name="copy-outline" size={16} color="#475569" style={{ marginRight: 4 }} />
+                <AppText style={styles.copyBtnText}>Copy Text</AppText>
+              </Pressable>
+            </View>
+
+            {/* Reverse & Cancel Sales Slip Button */}
             <Pressable
-              disabled={sharingImage}
-              style={[styles.sharePicBtn, sharingImage && { opacity: 0.7 }]}
-              onPress={handleShareImage}
+              disabled={reversing || sharingImage}
+              style={[styles.reverseSlipBtn, (reversing || sharingImage) && { opacity: 0.6 }]}
+              onPress={handleConfirmReverse}
             >
-              {sharingImage ? (
-                <ActivityIndicator size="small" color="#ffffff" style={{ marginRight: 6 }} />
+              {reversing ? (
+                <ActivityIndicator size="small" color="#dc2626" style={{ marginRight: 6 }} />
               ) : (
-                <Ionicons name="image-outline" size={18} color="#ffffff" style={{ marginRight: 6 }} />
+                <Ionicons name="arrow-undo-circle" size={18} color="#dc2626" style={{ marginRight: 6 }} />
               )}
-              <AppText style={styles.sharePicBtnText}>
-                {sharingImage ? 'Creating Image...' : 'Share Picture (WhatsApp)'}
+              <AppText style={styles.reverseSlipBtnText}>
+                {reversing ? 'Reversing Slip & Restoring Stock...' : 'Reverse / Delete Sales Slip'}
               </AppText>
             </Pressable>
-
-            <Pressable
-              style={styles.copyBtn}
-              onPress={handleCopy}
-            >
-              <Ionicons name="copy-outline" size={16} color="#475569" style={{ marginRight: 4 }} />
-              <AppText style={styles.copyBtnText}>Copy Text</AppText>
-            </Pressable>
+            <AppText variant="caption" muted style={styles.reverseHintText}>
+              Restores product units to inventory & reverses customer Khata balance
+            </AppText>
           </View>
         </View>
       </View>
@@ -474,9 +553,13 @@ const styles = StyleSheet.create({
   },
 
   modalActions: {
-    flexDirection: 'row',
     marginTop: 14,
     paddingTop: 6,
+  },
+  actionRowPrimary: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginBottom: 8,
   },
   sharePicBtn: {
     flex: 1.7,
@@ -513,5 +596,26 @@ const styles = StyleSheet.create({
     color: '#334155',
     fontWeight: '600',
     fontSize: 13,
+  },
+  reverseSlipBtn: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#fef2f2',
+    borderWidth: 1,
+    borderColor: '#fecaca',
+    paddingVertical: 10,
+    borderRadius: 10,
+  },
+  reverseSlipBtnText: {
+    color: '#dc2626',
+    fontWeight: '700',
+    fontSize: 13,
+  },
+  reverseHintText: {
+    fontSize: 10,
+    textAlign: 'center',
+    marginTop: 4,
+    color: '#94a3b8',
   },
 });

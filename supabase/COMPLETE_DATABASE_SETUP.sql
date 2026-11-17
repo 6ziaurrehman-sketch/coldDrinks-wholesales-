@@ -9363,3 +9363,396 @@ END;
 $$;
 
 GRANT EXECUTE ON FUNCTION public.admin_danger_delete_inventory(uuid) TO authenticated, service_role, anon;
+
+
+-- -----------------------------------------------------------------------------
+-- Migration: 20261115000001_top_selling_products_time_range_and_profit.sql
+-- -----------------------------------------------------------------------------
+DROP FUNCTION IF EXISTS public.wholesaler_get_top_selling_products();
+DROP FUNCTION IF EXISTS public.wholesaler_get_top_selling_products(text);
+DROP FUNCTION IF EXISTS public.wholesaler_get_top_selling_products(int);
+DROP FUNCTION IF EXISTS public.wholesaler_get_top_selling_products(text, int);
+
+CREATE OR REPLACE FUNCTION public.wholesaler_get_top_selling_products(
+  p_range text DEFAULT 'all',
+  p_limit int DEFAULT 10
+)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+  v_res jsonb;
+  v_now timestamptz := now();
+  v_today_start timestamptz := (date_trunc('day', v_now AT TIME ZONE 'Asia/Karachi') AT TIME ZONE 'Asia/Karachi');
+  v_start timestamptz;
+  v_end timestamptz;
+BEGIN
+  IF p_range = 'today' OR p_range = '1_day' THEN
+    v_start := v_today_start;
+    v_end := NULL;
+  ELSIF p_range = 'yesterday' THEN
+    v_start := (date_trunc('day', v_now AT TIME ZONE 'Asia/Karachi') - interval '1 day') AT TIME ZONE 'Asia/Karachi';
+    v_end := v_today_start;
+  ELSIF p_range = '3_days' THEN
+    v_start := (date_trunc('day', v_now AT TIME ZONE 'Asia/Karachi') - interval '2 days') AT TIME ZONE 'Asia/Karachi';
+    v_end := NULL;
+  ELSIF p_range = '7_days' OR p_range = 'week' THEN
+    v_start := (date_trunc('day', v_now AT TIME ZONE 'Asia/Karachi') - interval '6 days') AT TIME ZONE 'Asia/Karachi';
+    v_end := NULL;
+  ELSIF p_range = 'month' OR p_range = '30_days' THEN
+    v_start := (date_trunc('month', v_now AT TIME ZONE 'Asia/Karachi') AT TIME ZONE 'Asia/Karachi');
+    v_end := NULL;
+  ELSIF p_range = 'all' THEN
+    v_start := NULL;
+    v_end := NULL;
+  ELSE
+    -- default fallback: no boundary
+    v_start := NULL;
+    v_end := NULL;
+  END IF;
+
+  SELECT COALESCE(
+    jsonb_agg(
+      jsonb_build_object(
+        'product_name', t.product_name,
+        'size_label', t.size_label,
+        'cartons_sold', t.total_cartons,
+        'loose_sold', t.total_loose,
+        'total_units_sold', t.total_units,
+        'total_revenue', t.total_revenue,
+        'total_cost', t.total_cost,
+        'total_profit', t.total_profit
+      )
+    ),
+    '[]'::jsonb
+  ) INTO v_res
+  FROM (
+    SELECT
+      ti.product_name_snapshot AS product_name,
+      ti.size_label_snapshot AS size_label,
+      SUM(ti.cartons_qty)::integer AS total_cartons,
+      SUM(ti.loose_units_qty)::integer AS total_loose,
+      SUM(ti.total_units)::integer AS total_units,
+      ROUND(SUM(ti.line_total), 2)::numeric(12,2) AS total_revenue,
+      ROUND(
+        SUM(
+          ti.total_units * (
+            COALESCE(NULLIF(pv.cost_price, 0), COALESCE(pv.price, ti.price_per_carton, 0) * 0.85) / 
+            GREATEST(COALESCE(ti.pieces_per_carton, pv.pieces_per_unit, 1), 1)
+          )
+        ), 
+        2
+      )::numeric(12,2) AS total_cost,
+      ROUND(
+        SUM(
+          ti.line_total - (
+            ti.total_units * (
+              COALESCE(NULLIF(pv.cost_price, 0), COALESCE(pv.price, ti.price_per_carton, 0) * 0.85) / 
+              GREATEST(COALESCE(ti.pieces_per_carton, pv.pieces_per_unit, 1), 1)
+            )
+          )
+        ), 
+        2
+      )::numeric(12,2) AS total_profit
+    FROM public.sale_items ti
+    JOIN public.sales s ON s.id = ti.sale_id
+    LEFT JOIN public.product_variants pv ON pv.id = ti.variant_id
+    WHERE COALESCE(s.status, 'finalized') != 'cancelled'
+      AND (v_start IS NULL OR s.sale_date >= v_start)
+      AND (v_end IS NULL OR s.sale_date < v_end)
+    GROUP BY ti.product_name_snapshot, ti.size_label_snapshot
+    ORDER BY total_cartons DESC, total_units DESC, total_revenue DESC
+    LIMIT COALESCE(p_limit, 10)
+  ) t;
+
+  RETURN v_res;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.wholesaler_get_top_selling_products(text, int) TO anon, authenticated, service_role;
+
+
+-- -----------------------------------------------------------------------------
+-- Migration: 20261115000002_wholesaler_reverse_and_delete_sale_slip.sql
+-- -----------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.wholesaler_reverse_sale(p_sale_id uuid)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_sale record;
+  v_item record;
+  v_units integer;
+BEGIN
+  -- 1. Lock and fetch sale record
+  SELECT * INTO v_sale
+  FROM public.sales
+  WHERE id = p_sale_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'message', format('Sale %s not found or already deleted', p_sale_id)
+    );
+  END IF;
+
+  -- 2. Restore stock inventory for each line item
+  FOR v_item IN
+    SELECT variant_id, total_units, cartons_qty, loose_units_qty, pieces_per_carton
+    FROM public.sale_items
+    WHERE sale_id = p_sale_id
+  LOOP
+    IF v_item.variant_id IS NOT NULL THEN
+      v_units := COALESCE(
+        v_item.total_units,
+        (COALESCE(v_item.cartons_qty, 0) * GREATEST(COALESCE(v_item.pieces_per_carton, 1), 1)) + COALESCE(v_item.loose_units_qty, 0)
+      );
+
+      IF v_units > 0 THEN
+        UPDATE public.inventory
+        SET total_units = COALESCE(total_units, 0) + v_units,
+            updated_at = now()
+        WHERE variant_id = v_item.variant_id;
+      END IF;
+    END IF;
+  END LOOP;
+
+  -- 3. Adjust customer Khata balance if credit balance_due was recorded
+  IF v_sale.customer_id IS NOT NULL AND COALESCE(v_sale.balance_due, 0) > 0 THEN
+    UPDATE public.customers
+    SET current_balance = GREATEST(0, COALESCE(current_balance, 0) - v_sale.balance_due),
+        updated_at = now()
+    WHERE id = v_sale.customer_id;
+  END IF;
+
+  -- 4. Clean up associated customer payments and customer ledger entries
+  DELETE FROM public.customer_payments WHERE sale_id = p_sale_id;
+  DELETE FROM public.wholesaler_customer_ledger WHERE reference_id = p_sale_id::text;
+
+  -- 5. Clean up stock movement records for this sale
+  DELETE FROM public.stock_movements WHERE reference_id = p_sale_id::text;
+
+  -- 6. Delete sale items and the sale record itself
+  DELETE FROM public.sale_items WHERE sale_id = p_sale_id;
+  DELETE FROM public.sales WHERE id = p_sale_id;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'message', format('Sale slip %s successfully reversed, stock restored, and records removed.', COALESCE(v_sale.receipt_no, p_sale_id::text)),
+    'receipt_no', v_sale.receipt_no,
+    'customer_id', v_sale.customer_id
+  );
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.wholesaler_reverse_sale(uuid) TO authenticated, service_role, anon;
+
+CREATE OR REPLACE FUNCTION public.admin_danger_delete_sale(p_sale_id uuid)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  RETURN public.wholesaler_reverse_sale(p_sale_id);
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.admin_danger_delete_sale(uuid) TO authenticated, service_role, anon;
+
+
+-- -----------------------------------------------------------------------------
+-- Migration: 20261115000003_dashboard_profit_and_customer_insights.sql
+-- -----------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.wholesaler_get_dashboard_metrics(p_range text DEFAULT '1_day')
+RETURNS jsonb AS $$
+DECLARE
+  v_res jsonb;
+  v_now timestamptz := now() at time zone 'Asia/Karachi';
+  v_start timestamptz;
+BEGIN
+  IF p_range = '3_days' THEN
+    v_start := date_trunc('day', v_now - interval '3 days');
+  ELSIF p_range = '7_days' OR p_range = 'week' THEN
+    v_start := date_trunc('day', v_now - interval '7 days');
+  ELSIF p_range = '30_days' OR p_range = 'month' THEN
+    v_start := date_trunc('day', v_now - interval '30 days');
+  ELSIF p_range = 'year' OR p_range = '1_year' THEN
+    v_start := date_trunc('day', v_now - interval '365 days');
+  ELSIF p_range = 'all' THEN
+    v_start := '2000-01-01 00:00:00+00'::timestamptz;
+  ELSE
+    v_start := date_trunc('day', v_now);
+  END IF;
+
+  v_res := jsonb_build_object(
+    'total_active_products', (SELECT count(*) FROM public.products WHERE is_active = true),
+    'total_variants', (SELECT count(*) FROM public.product_variants WHERE is_active = true),
+    'low_stock_count', (
+      SELECT count(*) FROM public.inventory i
+      JOIN public.product_variants pv ON pv.id = i.variant_id
+      WHERE i.total_units > 0 AND i.total_units <= i.low_stock_threshold
+    ),
+    'out_of_stock_count', (
+      SELECT count(*) FROM public.inventory i
+      JOIN public.product_variants pv ON pv.id = i.variant_id
+      WHERE i.total_units = 0
+    ),
+    'total_stock_value', coalesce((
+      SELECT round(sum(i.total_units * (pv.cost_price::numeric / greatest(pv.pieces_per_unit, 1)::numeric)), 2)
+      FROM public.inventory i
+      JOIN public.product_variants pv ON pv.id = i.variant_id
+    ), 0),
+    'today_sales_count', (
+      SELECT count(*) FROM public.sales
+      WHERE sale_date >= v_start AND coalesce(status, 'finalized') != 'cancelled'
+    ),
+    'today_sales_amount', coalesce((
+      SELECT sum(total_amount) FROM public.sales
+      WHERE sale_date >= v_start AND coalesce(status, 'finalized') != 'cancelled'
+    ), 0),
+    'today_profit', coalesce((
+      SELECT round(
+        sum(
+          ti.line_total - (
+            ti.total_units * (
+              coalesce(nullif(pv.cost_price, 0), coalesce(pv.price, ti.price_per_carton, 0) * 0.85) /
+              greatest(coalesce(ti.pieces_per_carton, pv.pieces_per_unit, 1), 1)
+            )
+          )
+        ),
+        2
+      )
+      FROM public.sale_items ti
+      JOIN public.sales s ON s.id = ti.sale_id
+      LEFT JOIN public.product_variants pv ON pv.id = ti.variant_id
+      WHERE s.sale_date >= v_start AND coalesce(s.status, 'finalized') != 'cancelled'
+    ), 0),
+    'total_profit', coalesce((
+      SELECT round(
+        sum(
+          ti.line_total - (
+            ti.total_units * (
+              coalesce(nullif(pv.cost_price, 0), coalesce(pv.price, ti.price_per_carton, 0) * 0.85) /
+              greatest(coalesce(ti.pieces_per_carton, pv.pieces_per_unit, 1), 1)
+            )
+          )
+        ),
+        2
+      )
+      FROM public.sale_items ti
+      JOIN public.sales s ON s.id = ti.sale_id
+      LEFT JOIN public.product_variants pv ON pv.id = ti.variant_id
+      WHERE coalesce(s.status, 'finalized') != 'cancelled'
+    ), 0),
+    'today_cash_collected', coalesce((
+      SELECT sum(amount) FROM public.customer_payments
+      WHERE payment_date >= v_start
+    ), 0) + coalesce((
+      SELECT sum(paid_amount) FROM public.sales
+      WHERE customer_id IS NULL AND sale_date >= v_start AND coalesce(status, 'finalized') != 'cancelled'
+    ), 0),
+    'today_credit_sales', coalesce((
+      SELECT sum(balance_due) FROM public.sales
+      WHERE sale_date >= v_start AND coalesce(status, 'finalized') != 'cancelled'
+    ), 0),
+    'total_customer_receivables', coalesce((
+      SELECT sum(current_balance) FROM public.customers WHERE current_balance > 0
+    ), 0),
+    'total_supplier_payables', coalesce((
+      SELECT sum(balance_payable) FROM public.suppliers WHERE balance_payable > 0
+    ), 0)
+  );
+
+  RETURN v_res;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+GRANT EXECUTE ON FUNCTION public.wholesaler_get_dashboard_metrics(text) TO anon, authenticated, service_role;
+
+CREATE OR REPLACE FUNCTION public.wholesaler_get_customer_insights(p_customer_id uuid)
+RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_res jsonb;
+  v_cust record;
+  v_total_sales numeric;
+  v_sales_count int;
+  v_total_profit numeric;
+  v_total_credit_taken numeric;
+  v_total_payments_made numeric;
+  v_credit_sales_count int;
+  v_settled_credit_count int;
+BEGIN
+  SELECT * INTO v_cust FROM public.customers WHERE id = p_customer_id;
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'message', 'Customer not found');
+  END IF;
+
+  SELECT
+    coalesce(sum(total_amount), 0),
+    count(*)
+  INTO v_total_sales, v_sales_count
+  FROM public.sales
+  WHERE customer_id = p_customer_id AND coalesce(status, 'finalized') != 'cancelled';
+
+  SELECT coalesce(
+    round(
+      sum(
+        ti.line_total - (
+          ti.total_units * (
+            coalesce(nullif(pv.cost_price, 0), coalesce(pv.price, ti.price_per_carton, 0) * 0.85) /
+            greatest(coalesce(ti.pieces_per_carton, pv.pieces_per_unit, 1), 1)
+          )
+        )
+      ),
+      2
+    ),
+    0
+  ) INTO v_total_profit
+  FROM public.sale_items ti
+  JOIN public.sales s ON s.id = ti.sale_id
+  LEFT JOIN public.product_variants pv ON pv.id = ti.variant_id
+  WHERE s.customer_id = p_customer_id AND coalesce(s.status, 'finalized') != 'cancelled';
+
+  SELECT coalesce(sum(balance_due), 0), count(*)
+  INTO v_total_credit_taken, v_credit_sales_count
+  FROM public.sales
+  WHERE customer_id = p_customer_id AND coalesce(balance_due, 0) > 0 AND coalesce(status, 'finalized') != 'cancelled';
+
+  SELECT coalesce(sum(amount), 0), count(*)
+  INTO v_total_payments_made, v_settled_credit_count
+  FROM public.customer_payments
+  WHERE customer_id = p_customer_id;
+
+  v_res := jsonb_build_object(
+    'success', true,
+    'customer_id', p_customer_id,
+    'name', v_cust.name,
+    'owner_name', v_cust.owner_name,
+    'phone', v_cust.phone,
+    'address', v_cust.address,
+    'current_balance', coalesce(v_cust.current_balance, 0),
+    'credit_limit', coalesce(v_cust.credit_limit, 0),
+    'created_at', v_cust.created_at,
+    'total_sales', v_total_sales,
+    'sales_count', v_sales_count,
+    'total_profit', v_total_profit,
+    'total_credit_taken', v_total_credit_taken,
+    'credit_sales_count', v_credit_sales_count,
+    'total_payments_made', v_total_payments_made,
+    'payments_count', v_settled_credit_count
+  );
+
+  RETURN v_res;
+END;
+$$;
+
+GRANT EXECUTE ON FUNCTION public.wholesaler_get_customer_insights(uuid) TO anon, authenticated, service_role;

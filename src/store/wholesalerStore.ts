@@ -67,6 +67,7 @@ export interface WholesalerState extends AsyncSlice {
     items: { variant_id: string; cartons_qty: number; loose_units_qty: number; cost_per_carton: number }[];
   }) => Promise<void>;
   finalizeSale: (payload: WholesalerSalePayload) => Promise<WholesalerSaleReceipt>;
+  reverseSale: (saleId: string) => Promise<{ success: boolean; message: string; receipt_no?: string }>;
   loadSalesHistory: (search?: string, force?: boolean) => Promise<void>;
   recordCustomerPayment: (params: { customerId: string; amount: number; paymentMethod: string; referenceNo?: string; notes?: string }) => Promise<void>;
   recordCustomerReturn: (params: { customerId?: string; variantId: string; cartonsQty?: number; looseUnitsQty?: number; creditAmount?: number; reason: string; notes?: string }) => Promise<void>;
@@ -253,6 +254,27 @@ export const useWholesalerStore = create<WholesalerState>((set, get) => ({
         await get().loadCustomers(true);
         await get().loadSalesHistory(undefined, true);
         return receipt;
+      },
+      { rethrow: true }
+    );
+    return res!;
+  },
+
+  reverseSale: async (saleId: string) => {
+    const res = await get().run(
+      async () => {
+        const result = await wholesalerService.reverseSale(saleId);
+        lastInventoryFetch = 0;
+        lastDashboardFetch = 0;
+        lastCustomersFetch = 0;
+        lastSalesHistoryFetch = 0;
+        await Promise.allSettled([
+          get().loadInventory(undefined, true),
+          get().loadDashboard(undefined, true),
+          get().loadCustomers(true),
+          get().loadSalesHistory(undefined, true),
+        ]);
+        return result;
       },
       { rethrow: true }
     );

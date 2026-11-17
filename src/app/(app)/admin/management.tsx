@@ -28,6 +28,7 @@ import { wholesalerService } from '@/lib/wholesalerService';
 type MainTab = 'analytics' | 'danger_zone';
 type AnalyticsPeriod = 'week' | 'month' | 'all';
 type DangerCategory = 'stores' | 'orders' | 'inventory' | 'sales' | 'users';
+export type TopSellingRange = 'today' | 'yesterday' | '3_days' | '7_days' | 'month' | 'all';
 
 interface CustomerStoreItem {
   id: string;
@@ -127,6 +128,25 @@ export default function AdminManagementScreen() {
   const [sales, setSales] = useState<SaleItem[]>([]);
   const [users, setUsers] = useState<UserProfileItem[]>([]);
   const [topSelling, setTopSelling] = useState<any[]>([]);
+  const [topSellingRange, setTopSellingRange] = useState<TopSellingRange>('today');
+  const [loadingTopSelling, setLoadingTopSelling] = useState(false);
+
+  const fetchTopSelling = useCallback(async (rangeToFetch: TopSellingRange) => {
+    setLoadingTopSelling(true);
+    try {
+      const data = await wholesalerService.getTopSellingProducts(rangeToFetch, 10);
+      if (data) setTopSelling(data);
+    } catch (err) {
+      console.warn('Error loading top selling products:', err);
+    } finally {
+      setLoadingTopSelling(false);
+    }
+  }, []);
+
+  const handleSelectRange = (range: TopSellingRange) => {
+    setTopSellingRange(range);
+    void fetchTopSelling(range);
+  };
 
   // User/Shop Directory in Business Analytics
   const [directoryFilter, setDirectoryFilter] = useState<'all' | 'shops' | 'users'>('all');
@@ -335,9 +355,9 @@ export default function AdminManagementScreen() {
         );
       }
 
-      // 6. Top Selling RPC
+      // 6. Top Selling Best Sellers (default 'today')
       try {
-        const { data: topData } = await (supabase.rpc as any)('wholesaler_get_top_selling_products');
+        const topData = await wholesalerService.getTopSellingProducts('today', 10);
         if (topData) setTopSelling(topData);
       } catch {
         // Fallback gracefully
@@ -364,8 +384,9 @@ export default function AdminManagementScreen() {
 
   const onRefresh = async () => {
     setRefreshing(true);
-    await fetchData();
     await Promise.allSettled([
+      fetchData(),
+      fetchTopSelling(topSellingRange),
       loadDashboard(undefined, true),
       loadInventory(undefined, true),
       loadSalesHistory(undefined, true),
@@ -1059,41 +1080,139 @@ export default function AdminManagementScreen() {
               {/* Most Selling Items (Best Sellers) */}
               <View style={styles.sectionWrap}>
                 <View style={styles.sectionHeaderRow}>
-                  <AppText style={styles.sectionTitle}>🏆 MOST SELLING ITEMS</AppText>
-                  <AppText variant="caption" muted>Ranked by sales volume</AppText>
+                  <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                    <AppText style={styles.sectionTitle}>🏆 MOST SELLING ITEMS</AppText>
+                    {loadingTopSelling && (
+                      <ActivityIndicator size="small" color={colors.primary} style={{ marginLeft: 8 }} />
+                    )}
+                  </View>
+                  <AppText variant="caption" muted>Ranked by volume & profit</AppText>
                 </View>
+
+                {/* Time Range Filter Pills */}
+                <ScrollView
+                  horizontal
+                  showsHorizontalScrollIndicator={false}
+                  contentContainerStyle={styles.topSellingFilterScroll}
+                  style={{ marginBottom: 10 }}
+                >
+                  {[
+                    { key: 'today', label: 'Today', icon: 'today-outline' },
+                    { key: 'yesterday', label: 'Yesterday', icon: 'time-outline' },
+                    { key: '3_days', label: 'Last 3 Days', icon: 'calendar-outline' },
+                    { key: '7_days', label: 'Last 7 Days', icon: 'calendar' },
+                    { key: 'month', label: 'This Month', icon: 'calendar-number-outline' },
+                    { key: 'all', label: 'All Time', icon: 'infinite-outline' },
+                  ].map((filter) => {
+                    const isSelected = topSellingRange === filter.key;
+                    return (
+                      <Pressable
+                        key={filter.key}
+                        style={[
+                          styles.topSellingFilterPill,
+                          isSelected && [
+                            styles.topSellingFilterPillActive,
+                            { backgroundColor: colors.primary, borderColor: colors.primary },
+                          ],
+                        ]}
+                        onPress={() => handleSelectRange(filter.key as TopSellingRange)}
+                      >
+                        <Ionicons
+                          name={filter.icon as any}
+                          size={12}
+                          color={isSelected ? '#ffffff' : '#64748b'}
+                          style={{ marginRight: 5 }}
+                        />
+                        <AppText
+                          style={[
+                            styles.topSellingFilterPillText,
+                            isSelected && styles.topSellingFilterPillTextActive,
+                          ]}
+                        >
+                          {filter.label}
+                        </AppText>
+                      </Pressable>
+                    );
+                  })}
+                </ScrollView>
 
                 {topSelling.length === 0 ? (
                   <Card style={styles.emptyCard}>
                     <Ionicons name="cart-outline" size={32} color="#94a3b8" />
-                    <AppText variant="caption" muted style={{ marginTop: 6 }}>
-                      No sales recorded in this period yet.
+                    <AppText variant="caption" muted style={{ marginTop: 6, textAlign: 'center' }}>
+                      {topSellingRange === 'today'
+                        ? 'No sales recorded today yet.'
+                        : topSellingRange === 'yesterday'
+                        ? 'No sales recorded yesterday.'
+                        : topSellingRange === '3_days'
+                        ? 'No sales recorded in the last 3 days.'
+                        : topSellingRange === '7_days'
+                        ? 'No sales recorded in the last 7 days.'
+                        : topSellingRange === 'month'
+                        ? 'No sales recorded this month yet.'
+                        : 'No sales recorded yet.'}
                     </AppText>
                   </Card>
                 ) : (
-                  topSelling.map((item, idx) => (
-                    <Card key={idx} style={styles.topSellerCard}>
-                      <View style={styles.rankBadge}>
-                        <AppText style={styles.rankText}>#{idx + 1}</AppText>
-                      </View>
-                      <View style={{ flex: 1, marginHorizontal: 10 }}>
-                        <AppText style={styles.sellerName} numberOfLines={1}>
-                          {item.product_name}
-                        </AppText>
-                        <AppText variant="caption" muted>
-                          Size: {item.size_label || 'Standard'} • Sold: {item.cartons_sold} cartons ({item.total_units_sold || 0} units)
-                        </AppText>
-                      </View>
-                      <View style={{ alignItems: 'flex-end' }}>
-                        <AppText style={styles.sellerRevenue}>
-                          {formatMoney(item.total_revenue || 0)}
-                        </AppText>
-                        <AppText variant="caption" style={{ color: '#059669', fontSize: 10 }}>
-                          Total Revenue
-                        </AppText>
-                      </View>
-                    </Card>
-                  ))
+                  topSelling.map((item, idx) => {
+                    const rev = Number(item.total_revenue || 0);
+                    const profit = item.total_profit !== undefined && item.total_profit !== null
+                      ? Number(item.total_profit)
+                      : rev * 0.15;
+                    const isProfitPos = profit >= 0;
+
+                    return (
+                      <Card key={idx} style={styles.topSellerCard}>
+                        <View style={styles.rankBadge}>
+                          <AppText style={styles.rankText}>#{idx + 1}</AppText>
+                        </View>
+                        <View style={{ flex: 1, marginHorizontal: 10 }}>
+                          <AppText style={styles.sellerName} numberOfLines={1}>
+                            {item.product_name}
+                          </AppText>
+                          <AppText variant="caption" muted style={{ marginTop: 2 }}>
+                            Size: {item.size_label || 'Standard'}
+                          </AppText>
+                          <AppText variant="caption" muted style={{ marginTop: 1 }}>
+                            Sold: {item.cartons_sold || 0} ctn{item.loose_sold ? ` + ${item.loose_sold} pcs` : ''} ({item.total_units_sold || 0} units)
+                          </AppText>
+                        </View>
+                        <View style={{ alignItems: 'flex-end', justifyContent: 'center' }}>
+                          <AppText style={styles.sellerRevenue}>
+                            {formatMoney(rev)}
+                          </AppText>
+                          <AppText variant="caption" style={{ color: '#64748b', fontSize: 10 }}>
+                            Total Revenue
+                          </AppText>
+
+                          <View
+                            style={[
+                              styles.profitBadge,
+                              {
+                                backgroundColor: isProfitPos ? '#ecfdf5' : '#fef2f2',
+                                borderColor: isProfitPos ? '#a7f3d0' : '#fecaca',
+                              },
+                            ]}
+                          >
+                            <Ionicons
+                              name={isProfitPos ? 'trending-up' : 'trending-down'}
+                              size={10}
+                              color={isProfitPos ? '#059669' : '#dc2626'}
+                              style={{ marginRight: 3 }}
+                            />
+                            <AppText
+                              style={[
+                                styles.profitBadgeText,
+                                { color: isProfitPos ? '#059669' : '#dc2626' },
+                              ]}
+                            >
+                              {formatMoney(profit)} profit
+                            </AppText>
+                          </View>
+                        </View>
+                      </Card>
+                    );
+                  })
                 )}
               </View>
 
@@ -1951,6 +2070,48 @@ const styles = StyleSheet.create({
     padding: 12,
     borderRadius: 12,
     marginBottom: 8,
+  },
+  topSellingFilterScroll: {
+    paddingVertical: 2,
+    flexDirection: 'row',
+    alignItems: 'center',
+  },
+  topSellingFilterPill: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 18,
+    backgroundColor: '#f1f5f9',
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+    marginRight: 6,
+  },
+  topSellingFilterPillActive: {
+    backgroundColor: '#2563eb',
+    borderColor: '#2563eb',
+  },
+  topSellingFilterPillText: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: '#475569',
+  },
+  topSellingFilterPillTextActive: {
+    color: '#ffffff',
+    fontWeight: '700',
+  },
+  profitBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 6,
+    borderWidth: 1,
+    marginTop: 3,
+  },
+  profitBadgeText: {
+    fontSize: 10.5,
+    fontWeight: '700',
   },
   rankBadge: {
     width: 28,

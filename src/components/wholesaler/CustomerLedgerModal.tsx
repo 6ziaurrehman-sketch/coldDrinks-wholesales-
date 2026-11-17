@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import {
   View,
   StyleSheet,
@@ -35,6 +35,22 @@ export function CustomerLedgerModal({
   const { colors, spacing } = useTheme();
   const [ledgerEntries, setLedgerEntries] = useState<any[]>([]);
   const [loading, setLoading] = useState(false);
+  const [ledgerView, setLedgerView] = useState<'pending' | 'all'>('pending');
+  const [prevVisible, setPrevVisible] = useState(visible);
+
+  if (visible !== prevVisible) {
+    setPrevVisible(visible);
+    if (visible) {
+      setLedgerView('pending');
+    }
+  }
+
+  const displayedEntries = useMemo(() => {
+    if (ledgerView === 'pending') {
+      return ledgerEntries.filter((e) => Number(e.debit) > 0);
+    }
+    return ledgerEntries;
+  }, [ledgerEntries, ledgerView]);
 
   useEffect(() => {
     let active = true;
@@ -155,10 +171,65 @@ export function CustomerLedgerModal({
             />
           </Card>
 
+          {/* View Toggle: Pending Khata vs All History */}
+          <View style={styles.viewToggleRow}>
+            <Pressable
+              style={[
+                styles.viewToggleBtn,
+                ledgerView === 'pending' && [
+                  styles.viewToggleBtnActive,
+                  { backgroundColor: colors.primary, borderColor: colors.primary },
+                ],
+              ]}
+              onPress={() => setLedgerView('pending')}
+            >
+              <Ionicons
+                name="alert-circle"
+                size={14}
+                color={ledgerView === 'pending' ? '#ffffff' : '#64748b'}
+                style={{ marginRight: 4 }}
+              />
+              <AppText
+                style={[
+                  styles.viewToggleText,
+                  ledgerView === 'pending' && styles.viewToggleTextActive,
+                ]}
+              >
+                Pending Khata ({customer.current_balance > 0 ? formatMoney(customer.current_balance) : 'Rs 0'})
+              </AppText>
+            </Pressable>
+
+            <Pressable
+              style={[
+                styles.viewToggleBtn,
+                ledgerView === 'all' && [
+                  styles.viewToggleBtnActive,
+                  { backgroundColor: colors.primary, borderColor: colors.primary },
+                ],
+              ]}
+              onPress={() => setLedgerView('all')}
+            >
+              <Ionicons
+                name="receipt-outline"
+                size={14}
+                color={ledgerView === 'all' ? '#ffffff' : '#64748b'}
+                style={{ marginRight: 4 }}
+              />
+              <AppText
+                style={[
+                  styles.viewToggleText,
+                  ledgerView === 'all' && styles.viewToggleTextActive,
+                ]}
+              >
+                All History ({ledgerEntries.length})
+              </AppText>
+            </Pressable>
+          </View>
+
           {/* Transactions List */}
           <View style={styles.listHeaderRow}>
             <AppText variant="subtitle" style={styles.boldText}>
-              Transaction Ledger History
+              {ledgerView === 'pending' ? 'Outstanding Loan Slips' : 'All Transactions History'}
             </AppText>
             <Pressable onPress={handleRefresh} hitSlop={6}>
               <Ionicons name="refresh" size={18} color={colors.primary} />
@@ -172,16 +243,26 @@ export function CustomerLedgerModal({
                 Loading Loan Khata transactions...
               </AppText>
             </View>
-          ) : ledgerEntries.length === 0 ? (
+          ) : ledgerView === 'pending' && customer.current_balance <= 0 ? (
+            <Card style={styles.emptyCard}>
+              <Ionicons name="checkmark-circle-outline" size={38} color="#10b981" />
+              <AppText variant="body" style={[styles.boldText, { color: '#059669', marginTop: 8 }]}>
+                No Pending Khata Dues
+              </AppText>
+              <AppText variant="caption" muted style={{ marginTop: 4, textAlign: 'center' }}>
+                All previous loan khata for this shop has been completely paid and settled.
+              </AppText>
+            </Card>
+          ) : displayedEntries.length === 0 ? (
             <Card style={styles.emptyCard}>
               <Ionicons name="newspaper-outline" size={36} color={colors.textMuted} />
               <AppText variant="caption" muted style={{ marginTop: 8 }}>
-                No ledger entries for this shop yet.
+                {ledgerView === 'pending' ? 'No pending debit slips found.' : 'No ledger entries for this shop yet.'}
               </AppText>
             </Card>
           ) : (
             <ScrollView style={styles.ledgerScroll} contentContainerStyle={{ paddingBottom: spacing.lg }}>
-              {ledgerEntries.map((entry) => {
+              {displayedEntries.map((entry) => {
                 const isDebit = Number(entry.debit) > 0;
                 const isPayment = entry.entry_type === 'payment';
 
@@ -289,6 +370,36 @@ const styles = StyleSheet.create({
     padding: 14,
     borderRadius: 12,
     marginBottom: 14,
+  },
+  viewToggleRow: {
+    flexDirection: 'row',
+    marginBottom: 12,
+    gap: 8,
+  },
+  viewToggleBtn: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    paddingVertical: 7,
+    paddingHorizontal: 8,
+    borderRadius: 8,
+    backgroundColor: '#f1f5f9',
+    borderWidth: 1,
+    borderColor: '#e2e8f0',
+  },
+  viewToggleBtnActive: {
+    backgroundColor: '#2563eb',
+    borderColor: '#2563eb',
+  },
+  viewToggleText: {
+    fontSize: 11.5,
+    fontWeight: '600',
+    color: '#64748b',
+  },
+  viewToggleTextActive: {
+    color: '#ffffff',
+    fontWeight: '700',
   },
   listHeaderRow: {
     flexDirection: 'row',

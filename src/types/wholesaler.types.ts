@@ -51,8 +51,10 @@ export interface WholesalerCustomer {
   opening_balance: number;
   current_balance: number;
   notes: string | null;
+  credit_limit?: number | null;
   is_active: boolean;
   created_at: string;
+  updated_at?: string | null;
 }
 
 export interface WholesalerSupplier {
@@ -132,4 +134,38 @@ export interface WholesalerDashboardMetrics {
   today_credit_sales: number;
   total_customer_receivables: number;
   total_supplier_payables: number;
+  today_profit?: number;
+  total_profit?: number;
+  total_sales_amount?: number;
 }
+
+export interface ShopInsightsData {
+  success: boolean;
+  customer_id: string;
+  name: string;
+  owner_name?: string | null;
+  phone?: string | null;
+  address?: string | null;
+  current_balance: number;
+  credit_limit: number;
+  created_at: string;
+  total_sales: number;
+  sales_count: number;
+  total_profit: number;
+  total_credit_taken: number;
+  credit_sales_count: number;
+  total_payments_made: number;
+  payments_count: number;
+}
+
+export interface WholesalerTopSellingItem {
+  product_name: string;
+  size_label?: string | null;
+  cartons_sold: number;
+  loose_sold: number;
+  total_units_sold: number;
+  total_revenue: number;
+  total_cost?: number;
+  total_profit?: number;
+}
+

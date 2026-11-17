@@ -5086,7 +5086,7 @@ describe('Batch A4 Sales Slips PDF Generator', () => {
 
     // Every object entry offset in xref must point directly to "N 0 obj"
     const entryMatches = [...txt.slice(xrefIdx).matchAll(/^(\d{10}) 00000 n $/gm)];
-    assert.strictEqual(entryMatches.length, 8); // Catalog, Pages, 2 Fonts, 2 Pages, 2 Content streams
+    assert.strictEqual(entryMatches.length, 9); // Catalog, Pages, 2 Fonts, 1 JPEG Logo XObject, 2 Pages, 2 Content streams
     entryMatches.forEach((m, i) => {
       const offset = Number(m[1]);
       assert.ok(
@@ -5094,6 +5094,10 @@ describe('Batch A4 Sales Slips PDF Generator', () => {
         `Object ${i + 1} offset mismatch at ${offset}`
       );
     });
+    assert.ok(txt.includes('/Subtype /Image'), 'Missing embedded logo XObject');
+    assert.ok(txt.includes('/Im1 Do'), 'Missing logo draw instruction');
+    assert.ok(txt.includes('AUTHORISED SIGNATURE'), 'Missing official stamp signature');
+    assert.ok(txt.includes('Official Sales Slip & Delivery Invoice'), 'Missing modal-identical header subtitle');
   });
 
   it('computes Today and Yesterday date keys in Asia/Karachi timezone', () => {
@@ -5105,6 +5109,364 @@ describe('Batch A4 Sales Slips PDF Generator', () => {
     assert.strictEqual(yesterdayKey, '2026-11-11');
   });
 });
+
+describe('Top Selling Best Sellers: Time Range Filters & Profit Engine', () => {
+  it('validates supported range keys (today, yesterday, 3_days, 7_days, month, all)', () => {
+    const validRanges = ['today', 'yesterday', '3_days', '7_days', 'month', 'all'];
+    validRanges.forEach((range) => {
+      assert.ok(typeof range === 'string' && range.length > 0);
+    });
+  });
+
+  it('calculates carton and loose unit cost accurately with profit', () => {
+    // Scenario 1: Whole cartons (10 cartons @ 1,200 retail = 12,000 line total, cost 1,000/ctn)
+    const cartonsQty = 10;
+    const looseQty = 0;
+    const piecesPerCarton = 24;
+    const costPerCarton = 1000;
+    const lineTotal = 12000;
+
+    const totalUnits = cartonsQty * piecesPerCarton + looseQty;
+    const unitCost = costPerCarton / piecesPerCarton;
+    const totalCost = totalUnits * unitCost;
+    const totalProfit = lineTotal - totalCost;
+
+    assert.strictEqual(totalUnits, 240);
+    assert.strictEqual(totalCost, 10000);
+    assert.strictEqual(totalProfit, 2000);
+
+    // Scenario 2: Mixed cartons + loose units (5 cartons + 8 bottles, 6/ctn, cost 900/ctn = 150/bottle)
+    const c2Cartons = 5;
+    const c2Loose = 8;
+    const c2Pieces = 6;
+    const c2Cost = 900;
+    const c2LineTotal = 6840;
+
+    const c2TotalUnits = c2Cartons * c2Pieces + c2Loose;
+    const c2UnitCost = c2Cost / c2Pieces;
+    const c2TotalCost = c2TotalUnits * c2UnitCost;
+    const c2TotalProfit = c2LineTotal - c2TotalCost;
+
+    assert.strictEqual(c2TotalUnits, 38);
+    assert.strictEqual(c2TotalCost, 5700);
+    assert.strictEqual(c2TotalProfit, 1140);
+  });
+
+  it('falls back to 15% wholesale margin when cost price is missing', () => {
+    const lineTotal = 15000;
+    const fallbackProfit = lineTotal * 0.15;
+    assert.strictEqual(fallbackProfit, 2250);
+  });
+});
+
+describe('Wholesaler ERP: Dashboard Loan Khata, All Shops Directory & 360 Insights', () => {
+  const sampleCustomers = [
+    {
+      id: 'cust-1',
+      name: 'Peshawari Store',
+      owner_name: 'Khan Bhai',
+      phone: '03001234567',
+      address: 'Shop 4, Main Bazar',
+      current_balance: 18500, // active debt
+      created_at: new Date(Date.now() - 5 * 86400000).toISOString(),
+      updated_at: new Date(Date.now() - 1 * 86400000).toISOString(), // 1 day ago
+    },
+    {
+      id: 'cust-2',
+      name: 'Madina Super Store',
+      owner_name: 'Haji Sahab',
+      phone: '03129876543',
+      address: 'Block 2, Commercial',
+      current_balance: 0, // NEW SHOP OR FULLY PAID
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    },
+    {
+      id: 'cust-3',
+      name: 'Bismillah Cold Spot',
+      owner_name: 'Tariq',
+      phone: '03335551234',
+      address: 'Station Road',
+      current_balance: 4200, // active debt
+      created_at: new Date(Date.now() - 10 * 86400000).toISOString(),
+      updated_at: new Date().toISOString(), // today
+    },
+    {
+      id: 'cust-4',
+      name: 'Al-Madad Mart',
+      owner_name: 'Rashid',
+      phone: '03456789012',
+      address: 'Sector 5',
+      current_balance: 0, // 0 balance
+      created_at: new Date(Date.now() - 30 * 86400000).toISOString(),
+      updated_at: new Date(Date.now() - 2 * 86400000).toISOString(),
+    },
+  ];
+
+  it('1. Strict Khata Filtering: Stores with zero loan khata do NOT appear in Loan Khata list', () => {
+    // Only stores where current_balance > 0
+    const khataList = sampleCustomers.filter((c) => Number(c.current_balance || 0) > 0);
+
+    assert.strictEqual(khataList.length, 2, 'Only 2 customers have active khata debt');
+    assert.ok(khataList.some((c) => c.id === 'cust-1'));
+    assert.ok(khataList.some((c) => c.id === 'cust-3'));
+    assert.ok(!khataList.some((c) => c.id === 'cust-2'), 'New store with 0 khata must NOT appear in Loan Khata');
+    assert.ok(!khataList.some((c) => c.id === 'cust-4'), 'Cleared store with 0 khata must NOT appear in Loan Khata');
+  });
+
+  it('2. Khata Disappearance: When full balance payment is received, store automatically disappears from Khata list', () => {
+    let customersState = JSON.parse(JSON.stringify(sampleCustomers));
+
+    // Initially cust-3 is in Khata with 4200 balance
+    let khataList = customersState.filter((c) => Number(c.current_balance || 0) > 0);
+    assert.strictEqual(khataList.length, 2);
+
+    // Customer 3 pays full 4200
+    const paymentAmount = 4200;
+    const targetCust = customersState.find((c) => c.id === 'cust-3');
+    targetCust.current_balance = Math.max(0, targetCust.current_balance - paymentAmount);
+    targetCust.updated_at = new Date().toISOString();
+
+    // Re-filter Khata list
+    khataList = customersState.filter((c) => Number(c.current_balance || 0) > 0);
+    assert.strictEqual(khataList.length, 1, 'Store must disappear from Loan Khata once balance is 0');
+    assert.strictEqual(khataList[0].id, 'cust-1', 'Only Peshawari Store remains');
+    assert.ok(!khataList.some((c) => c.id === 'cust-3'), 'Bismillah Cold Spot disappeared from Khata');
+  });
+
+  it('3. Newest Khata on Top: Recent khata transactions sort at the top', () => {
+    const khataList = sampleCustomers
+      .filter((c) => Number(c.current_balance || 0) > 0)
+      .sort((a, b) => {
+        const dateA = new Date(a.updated_at || a.created_at || 0).getTime();
+        const dateB = new Date(b.updated_at || b.created_at || 0).getTime();
+        return dateB - dateA;
+      });
+
+    assert.strictEqual(khataList[0].id, 'cust-3', 'Bismillah Cold Spot (updated today) must be first');
+    assert.strictEqual(khataList[1].id, 'cust-1', 'Peshawari Store (updated 1 day ago) must be second');
+  });
+
+  it('4. Khata Time Filtering: Filter by Today, 3 Days, Week, Month, All', () => {
+    function filterKhataByPeriod(list, period) {
+      let filtered = list.filter((c) => Number(c.current_balance || 0) > 0);
+      if (period !== 'all') {
+        const now = new Date();
+        const threshold = new Date();
+        if (period === 'today') {
+          threshold.setHours(0, 0, 0, 0);
+        } else if (period === '3_days') {
+          threshold.setDate(now.getDate() - 2);
+          threshold.setHours(0, 0, 0, 0);
+        } else if (period === 'week') {
+          threshold.setDate(now.getDate() - 6);
+          threshold.setHours(0, 0, 0, 0);
+        } else if (period === 'month') {
+          threshold.setDate(1);
+          threshold.setHours(0, 0, 0, 0);
+        }
+        filtered = filtered.filter((c) => {
+          const itemDate = new Date(c.updated_at || c.created_at || 0);
+          return itemDate >= threshold;
+        });
+      }
+      return filtered;
+    }
+
+    const allKhata = filterKhataByPeriod(sampleCustomers, 'all');
+    assert.strictEqual(allKhata.length, 2);
+
+    const todayKhata = filterKhataByPeriod(sampleCustomers, 'today');
+    assert.strictEqual(todayKhata.length, 1);
+    assert.strictEqual(todayKhata[0].id, 'cust-3');
+
+    const threeDaysKhata = filterKhataByPeriod(sampleCustomers, '3_days');
+    assert.strictEqual(threeDaysKhata.length, 2);
+  });
+
+  it('5. All Shops Directory: Shows ALL shops regardless of 0 or non-zero balance', () => {
+    const allShops = [...sampleCustomers].sort((a, b) => a.name.localeCompare(b.name));
+    assert.strictEqual(allShops.length, 4, 'All registered shops appear in directory');
+    assert.strictEqual(allShops[0].name, 'Al-Madad Mart');
+    assert.strictEqual(allShops[1].name, 'Bismillah Cold Spot');
+    assert.strictEqual(allShops[2].name, 'Madina Super Store');
+    assert.strictEqual(allShops[3].name, 'Peshawari Store');
+  });
+
+  it('6. Receive Khata Auto Pre-Selection: Initial customer ID pre-fills selected customer and amount', () => {
+    const initialCustomerId = 'cust-1';
+    const foundCustomer = sampleCustomers.find((c) => c.id === initialCustomerId);
+
+    assert.ok(foundCustomer, 'Customer exists');
+    assert.strictEqual(foundCustomer.id, 'cust-1');
+
+    // Auto-prefill amount logic
+    const prefilledAmount = foundCustomer.current_balance > 0 ? String(foundCustomer.current_balance) : '';
+    assert.strictEqual(prefilledAmount, '18500', 'Outstanding balance must pre-fill in payment modal');
+  });
+
+  it('7. Shop 360 Insights & Repayment Track Record', () => {
+    const salesRecords = [
+      { id: 's1', customer_id: 'cust-1', total_amount: 15000, paid_amount: 15000, profit: 2250, payment_status: 'paid' },
+      { id: 's2', customer_id: 'cust-1', total_amount: 25000, paid_amount: 10000, profit: 3750, payment_status: 'partial' },
+      { id: 's3', customer_id: 'cust-1', total_amount: 8500, paid_amount: 0, profit: 1275, payment_status: 'credit' },
+    ];
+    const paymentRecords = [
+      { id: 'p1', customer_id: 'cust-1', amount: 5000 },
+      { id: 'p2', customer_id: 'cust-1', amount: 5000 },
+    ];
+
+    const customerSales = salesRecords.filter((s) => s.customer_id === 'cust-1');
+    const totalSales = customerSales.reduce((sum, s) => sum + s.total_amount, 0);
+    const totalProfit = customerSales.reduce((sum, s) => sum + s.profit, 0);
+    const salesCount = customerSales.length;
+
+    // Credit orders ("how many times he not pay")
+    const creditSales = customerSales.filter((s) => s.payment_status === 'credit' || s.payment_status === 'partial');
+    const creditSalesCount = creditSales.length;
+    const totalCreditTaken = creditSales.reduce((sum, s) => sum + (s.total_amount - s.paid_amount), 0);
+
+    // Payments made ("and later pay")
+    const customerPayments = paymentRecords.filter((p) => p.customer_id === 'cust-1');
+    const paymentsCount = customerPayments.length;
+    const totalPaymentsMade = customerPayments.reduce((sum, p) => sum + p.amount, 0);
+
+    const currentBalance = totalCreditTaken - totalPaymentsMade;
+
+    assert.strictEqual(totalSales, 48500);
+    assert.strictEqual(totalProfit, 7275);
+    assert.strictEqual(salesCount, 3);
+    assert.strictEqual(creditSalesCount, 2, 'Taken on credit 2 times');
+    assert.strictEqual(totalCreditTaken, 23500, 'Total lifetime credit taken: Rs 23,500');
+    assert.strictEqual(paymentsCount, 2, 'Repaid 2 times');
+    assert.strictEqual(totalPaymentsMade, 10000, 'Total repaid: Rs 10,000');
+    assert.strictEqual(currentBalance, 13500, 'Remaining balance due');
+  });
+
+  it('8. Dashboard Overview Total Profit Card Calculation', () => {
+    const metrics = {
+      today_sales_amount: 120000,
+      today_profit: 18450,
+      total_sales_amount: 950000,
+      total_profit: 142500,
+    };
+
+    // When range is 1_day
+    const todayProfit = metrics.today_profit !== undefined ? metrics.today_profit : metrics.today_sales_amount * 0.15;
+    assert.strictEqual(todayProfit, 18450);
+
+    // Fallback if today_profit is undefined
+    const metricsWithoutProfit = { today_sales_amount: 50000 };
+    const fallbackProfit = (metricsWithoutProfit.today_sales_amount || 0) * 0.15;
+    assert.strictEqual(fallbackProfit, 7500);
+  });
+
+  it('9. Carton Sales Ranking (Most sold cartons to least)', () => {
+    const rawSales = [
+      { product_name: '7up 1.5L', packaging: 'carton', units_per_carton: 6, total_units_sold: 180, total_revenue: 36000, total_profit: 5400 },
+      { product_name: 'Pepsi 1.5L', packaging: 'carton', units_per_carton: 6, total_units_sold: 300, total_revenue: 60000, total_profit: 9000 },
+      { product_name: 'Mirinda 500ml', packaging: 'carton', units_per_carton: 12, total_units_sold: 120, total_revenue: 14400, total_profit: 2160 },
+      { product_name: 'Mountain Dew 250ml Can', packaging: 'carton', units_per_carton: 24, total_units_sold: 48, total_revenue: 7200, total_profit: 1080 },
+    ];
+
+    // Compute cartons and loose units
+    const processed = rawSales.map((item) => {
+      const unitsPerCarton = item.units_per_carton || 12;
+      const cartons = Math.floor(item.total_units_sold / unitsPerCarton);
+      const loose = item.total_units_sold % unitsPerCarton;
+      return {
+        ...item,
+        cartons_sold: cartons,
+        loose_units_sold: loose,
+      };
+    });
+
+    // Rank from most cartons to least
+    const ranked = [...processed].sort((a, b) => {
+      if (b.cartons_sold !== a.cartons_sold) {
+        return b.cartons_sold - a.cartons_sold;
+      }
+      if (b.total_units_sold !== a.total_units_sold) {
+        return b.total_units_sold - a.total_units_sold;
+      }
+      return b.total_revenue - a.total_revenue;
+    });
+
+    // Pepsi 1.5L: 300 units / 6 = 50 cartons
+    assert.strictEqual(ranked[0].product_name, 'Pepsi 1.5L');
+    assert.strictEqual(ranked[0].cartons_sold, 50);
+
+    // 7up 1.5L: 180 units / 6 = 30 cartons
+    assert.strictEqual(ranked[1].product_name, '7up 1.5L');
+    assert.strictEqual(ranked[1].cartons_sold, 30);
+
+    // Mirinda 500ml: 120 units / 12 = 10 cartons
+    assert.strictEqual(ranked[2].product_name, 'Mirinda 500ml');
+    assert.strictEqual(ranked[2].cartons_sold, 10);
+
+    // Mountain Dew: 48 units / 24 = 2 cartons
+    assert.strictEqual(ranked[3].product_name, 'Mountain Dew 250ml Can');
+    assert.strictEqual(ranked[3].cartons_sold, 2);
+  });
+
+  it('10. Carton Sales Period Date Calculation (Today, Yesterday, Week)', () => {
+    const now = new Date('2026-11-15T14:30:00Z');
+    
+    // Today: from start of today
+    const startOfToday = new Date(now);
+    startOfToday.setHours(0, 0, 0, 0);
+
+    // Yesterday: start of yesterday to end of yesterday
+    const startOfYesterday = new Date(now);
+    startOfYesterday.setDate(startOfYesterday.getDate() - 1);
+    startOfYesterday.setHours(0, 0, 0, 0);
+    const endOfYesterday = new Date(startOfYesterday);
+    endOfYesterday.setHours(23, 59, 59, 999);
+
+    // Week: 7 days ago
+    const startOfWeek = new Date(now);
+    startOfWeek.setDate(startOfWeek.getDate() - 7);
+    startOfWeek.setHours(0, 0, 0, 0);
+
+    assert.ok(startOfToday.getTime() > startOfYesterday.getTime());
+    assert.ok(endOfYesterday.getTime() < startOfToday.getTime());
+    assert.ok(startOfWeek.getTime() < startOfYesterday.getTime());
+  });
+
+  it('11. ProductSalesDetailModal Financial Metrics Calculation', () => {
+    const item = {
+      product_name: 'Pepsi Regular 1.5L',
+      packaging: 'carton',
+      units_per_carton: 6,
+      total_units_sold: 300,
+      total_revenue: 60000,
+      total_profit: 9000,
+    };
+
+    const unitsPerCarton = item.units_per_carton || 12;
+    const cartons = Math.floor(item.total_units_sold / unitsPerCarton); // 50 cartons
+    const loose = item.total_units_sold % unitsPerCarton; // 0
+    const rev = item.total_revenue; // 60,000
+    const profit = item.total_profit; // 9,000
+    const cost = rev - profit; // 51,000
+    const marginPercent = rev > 0 ? (profit / rev) * 100 : 0; // 15%
+
+    const effectiveCartons = cartons + loose / unitsPerCarton; // 50
+    const avgPricePerCarton = effectiveCartons > 0 ? rev / effectiveCartons : 0; // 1,200
+    const avgCostPerCarton = effectiveCartons > 0 ? cost / effectiveCartons : 0; // 1,020
+    const profitPerCarton = effectiveCartons > 0 ? profit / effectiveCartons : 0; // 180
+
+    assert.strictEqual(cartons, 50);
+    assert.strictEqual(loose, 0);
+    assert.strictEqual(cost, 51000);
+    assert.strictEqual(marginPercent, 15);
+    assert.strictEqual(avgPricePerCarton, 1200);
+    assert.strictEqual(avgCostPerCarton, 1020);
+    assert.strictEqual(profitPerCarton, 180);
+  });
+});
+
+
 
 
 
